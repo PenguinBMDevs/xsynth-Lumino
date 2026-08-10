@@ -65,6 +65,42 @@ pub enum RealtimeSynthError {
     UnsupportedSampleFormat(cpal::SampleFormat),
 }
 
+/// 音频流重定向（restart）错误。
+///
+/// Lumino vendored 扩展：音频设备被拔出/更换后，将输出流重定向到
+/// 系统默认输出设备（合成管线保持不变）时可能出现的错误。
+#[derive(Debug, Error)]
+pub enum StreamRestartError {
+    /// 找不到默认输出设备
+    #[error("failed to find default output device")]
+    NoDefaultDevice,
+
+    /// 获取默认输出配置失败
+    #[error("failed to get default output config: {0}")]
+    DefaultOutputConfig(#[from] DefaultStreamConfigError),
+
+    /// 新设备参数与合成管线参数不一致（采样率/声道数/采样格式），
+    /// 直接重定向会导致数据语义错乱，必须重建整个合成管线。
+    #[error("output device config changed, pipeline must be rebuilt: {0}")]
+    ConfigChanged(String),
+
+    /// 构建输出流失败
+    #[error("failed to build output stream: {0}")]
+    Build(#[from] BuildStreamError),
+
+    /// 启动输出流失败
+    #[error("failed to play output stream: {0}")]
+    Play(#[from] PlayStreamError),
+
+    /// 不支持的采样格式
+    #[error("unsupported sample format: {0:?}")]
+    UnsupportedSampleFormat(cpal::SampleFormat),
+
+    /// stream owner 线程已退出（合成器已关闭）
+    #[error("stream owner thread is not running")]
+    StreamThreadDown,
+}
+
 /// Holds the statistics for an instance of RealtimeSynth.
 #[derive(Debug, Clone)]
 struct RealtimeSynthStats {
@@ -134,11 +170,20 @@ pub struct RealtimeSynth {
     stats: RealtimeSynthStats,
 
     stream_params: AudioStreamParams,
+
+    /// 自愈重定向失败通知（err_fn 触发 RestartSelf 失败时由 stream owner 线程发送）
+    recovery_rx: crossbeam_channel::Receiver<StreamRestartError>,
 }
 
 enum StreamCommand {
     Pause(crossbeam_channel::Sender<Result<(), PauseStreamError>>),
     Resume(crossbeam_channel::Sender<Result<(), PlayStreamError>>),
+    /// 重定向音频流到系统默认输出设备（同步等待结果）。
+    /// Lumino vendored 扩展。
+    Restart(crossbeam_channel::Sender<Result<(), StreamRestartError>>),
+    /// 音频流自愈：err_fn 检测到设备不可用时触发（无需回复，
+    /// 失败通过 recovery 通道通知上层）。Lumino vendored 扩展。
+    RestartSelf,
     Shutdown,
 }
 
@@ -227,7 +272,7 @@ impl RealtimeSynth {
             )
             .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
         ));
-        let (stream_control, stream_owner) =
+        let (stream_control, stream_owner, recovery_rx) =
             spawn_stream_thread(device.clone(), stream_config, buffered.clone())?;
 
         let max_nps = Arc::new(ReadWriteAtomicU64::new(10000));
@@ -245,6 +290,7 @@ impl RealtimeSynth {
 
             stats,
             stream_params,
+            recovery_rx,
         })
     }
 
@@ -337,6 +383,34 @@ impl RealtimeSynth {
         let sample_rate = self.stream_params.sample_rate;
         let size = calculate_render_size(sample_rate, render_window_ms);
         data.buffered_renderer.lock().unwrap().set_render_size(size);
+    }
+
+    /// 将音频流重定向到系统默认输出设备（合成管线保持不变）。
+    ///
+    /// Lumino vendored 扩展：音频设备被拔出/更换后调用。
+    /// 仅当新设备的采样率/声道数/采样格式与当前一致时可直接重定向；
+    /// 否则返回 [`StreamRestartError::ConfigChanged`]，调用方应重建整个合成管线。
+    pub fn restart_stream(&self) -> Result<(), StreamRestartError> {
+        let data = self.data.as_ref().unwrap();
+        let (sender, receiver) = bounded(1);
+        if data
+            .stream_control
+            .send(StreamCommand::Restart(sender))
+            .is_err()
+        {
+            return Err(StreamRestartError::StreamThreadDown);
+        }
+        receiver
+            .recv()
+            .unwrap_or(Err(StreamRestartError::StreamThreadDown))
+    }
+
+    /// 检查自愈重定向（err_fn 触发）是否失败。
+    ///
+    /// Lumino vendored 扩展：返回 `Some` 表示音频流自愈失败
+    /// （通常因新设备参数与管线不一致），需要上层介入重建管线。
+    pub fn poll_recovery_error(&self) -> Option<StreamRestartError> {
+        self.recovery_rx.try_recv().ok()
     }
 }
 
@@ -466,11 +540,18 @@ fn build_output_stream(
     device: &Device,
     stream_config: SupportedStreamConfig,
     buffered: Arc<Mutex<BufferedRenderer>>,
+    restart_notify: crossbeam_channel::Sender<StreamCommand>,
 ) -> Result<Stream, RealtimeSynthError> {
     match stream_config.sample_format() {
-        cpal::SampleFormat::F32 => build_output_stream_for::<f32>(device, stream_config, buffered),
-        cpal::SampleFormat::I16 => build_output_stream_for::<i16>(device, stream_config, buffered),
-        cpal::SampleFormat::U16 => build_output_stream_for::<u16>(device, stream_config, buffered),
+        cpal::SampleFormat::F32 => {
+            build_output_stream_for::<f32>(device, stream_config, buffered, restart_notify)
+        }
+        cpal::SampleFormat::I16 => {
+            build_output_stream_for::<i16>(device, stream_config, buffered, restart_notify)
+        }
+        cpal::SampleFormat::U16 => {
+            build_output_stream_for::<u16>(device, stream_config, buffered, restart_notify)
+        }
         _ => Err(RealtimeSynthError::UnsupportedSampleFormat(
             stream_config.sample_format(),
         )),
@@ -481,8 +562,18 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
     device: &Device,
     stream_config: SupportedStreamConfig,
     buffered: Arc<Mutex<BufferedRenderer>>,
+    restart_notify: crossbeam_channel::Sender<StreamCommand>,
 ) -> Result<Stream, RealtimeSynthError> {
-    let err_fn = |err| eprintln!("an error occurred on stream: {err}");
+    let err_fn = move |err| {
+        eprintln!("an error occurred on stream: {err}");
+        // Lumino vendored 扩展：设备被拔出/更换（DeviceNotAvailable）时，
+        // 通知 stream owner 线程将流重定向到系统默认输出设备。
+        // err_fn 在 cpal 音频线程上执行：仅发送非阻塞消息后返回，
+        // 线程随后退出（cpal 错误后 Break），owner 线程 drop 旧流不会死锁。
+        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+            let _ = restart_notify.send(StreamCommand::RestartSelf);
+        }
+    };
     let mut output_vec = Vec::new();
     let mut limiter = VolumeLimiter::new(stream_config.channels());
 
@@ -508,15 +599,24 @@ fn spawn_stream_thread(
     (
         crossbeam_channel::Sender<StreamCommand>,
         thread::JoinHandle<()>,
+        crossbeam_channel::Receiver<StreamRestartError>,
     ),
     RealtimeSynthError,
 > {
     let (command_sender, command_receiver) = unbounded();
     let (ready_sender, ready_receiver) = bounded(1);
+    let (recovery_sender, recovery_receiver) = unbounded();
+    // 供流构建与 restart 使用的命令发送器（闭包 move 克隆，原始 sender 返回给调用方）
+    let command_sender_for_stream = command_sender.clone();
     let join_handle = thread::Builder::new()
         .name("xsynth_stream_owner".to_string())
         .spawn(move || {
-            let stream = match build_output_stream(&device, stream_config, buffered) {
+            let mut stream = match build_output_stream(
+                &device,
+                stream_config.clone(),
+                buffered.clone(),
+                command_sender_for_stream.clone(),
+            ) {
                 Ok(stream) => stream,
                 Err(err) => {
                     let _ = ready_sender.send(Err(err));
@@ -539,6 +639,27 @@ fn spawn_stream_thread(
                     StreamCommand::Resume(reply) => {
                         let _ = reply.send(stream.play());
                     }
+                    StreamCommand::Restart(reply) => {
+                        let result = restart_stream(
+                            &mut stream,
+                            &stream_config,
+                            &buffered,
+                            &command_sender_for_stream,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    StreamCommand::RestartSelf => {
+                        if let Err(err) = restart_stream(
+                            &mut stream,
+                            &stream_config,
+                            &buffered,
+                            &command_sender_for_stream,
+                        ) {
+                            // 自愈失败（通常是设备参数变化）：通知上层重建管线
+                            eprintln!("xsynth-realtime: audio stream restart failed: {err}");
+                            let _ = recovery_sender.send(err);
+                        }
+                    }
                     StreamCommand::Shutdown => break,
                 }
             }
@@ -546,7 +667,7 @@ fn spawn_stream_thread(
         .map_err(RealtimeSynthError::StreamThreadSpawn)?;
 
     match ready_receiver.recv() {
-        Ok(Ok(())) => Ok((command_sender, join_handle)),
+        Ok(Ok(())) => Ok((command_sender, join_handle, recovery_receiver)),
         Ok(Err(err)) => {
             let _ = join_handle.join();
             Err(err)
@@ -556,6 +677,74 @@ fn spawn_stream_thread(
             Err(RealtimeSynthError::StreamThreadInit)
         }
     }
+}
+
+/// 将音频流重定向到系统默认输出设备。
+///
+/// Lumino vendored 扩展：在 stream owner 线程内执行。
+/// 先校验新设备参数（采样率/声道数/采样格式）与当前管线参数一致，
+/// 再 drop 旧流并构建新流；合成管线（BufferedRenderer）保持不变。
+/// 校验失败时旧流保持原样（不中断），由上层决定是否重建管线。
+fn restart_stream(
+    stream: &mut Stream,
+    old_config: &SupportedStreamConfig,
+    buffered: &Arc<Mutex<BufferedRenderer>>,
+    restart_notify: &crossbeam_channel::Sender<StreamCommand>,
+) -> Result<(), StreamRestartError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(StreamRestartError::NoDefaultDevice)?;
+
+    let new_config = device
+        .default_output_config()
+        .map_err(StreamRestartError::DefaultOutputConfig)?;
+
+    // 管线参数一致性校验：任一变化都会导致渲染数据语义错乱（变调/声道错乱），
+    // 必须由上层重建整个合成管线。旧流保持原样，等待上层决定。
+    if new_config.sample_rate() != old_config.sample_rate()
+        || new_config.channels() != old_config.channels()
+        || new_config.sample_format() != old_config.sample_format()
+    {
+        return Err(StreamRestartError::ConfigChanged(format!(
+            "sample_rate {}->{} Hz, channels {}->{}, format {:?}->{:?}",
+            old_config.sample_rate().0,
+            new_config.sample_rate().0,
+            old_config.channels(),
+            new_config.channels(),
+            old_config.sample_format(),
+            new_config.sample_format(),
+        )));
+    }
+
+    // 构建新流（新设备）。若失败，旧流不受影响。
+    let new_stream = match build_output_stream(
+        &device,
+        new_config,
+        buffered.clone(),
+        restart_notify.clone(),
+    ) {
+        Ok(stream) => stream,
+        Err(RealtimeSynthError::BuildStream(err)) => {
+            return Err(StreamRestartError::Build(err))
+        }
+        Err(RealtimeSynthError::UnsupportedSampleFormat(fmt)) => {
+            return Err(StreamRestartError::UnsupportedSampleFormat(fmt))
+        }
+        Err(other) => {
+            return Err(StreamRestartError::ConfigChanged(format!(
+                "failed to build output stream: {other}"
+            )))
+        }
+    };
+    new_stream.play().map_err(StreamRestartError::Play)?;
+
+    // 替换持有的流：旧流在此 drop（等待其内部线程退出）。
+    // cpal 错误后音频线程已退出（Break），join 立即返回，无死锁。
+    *stream = new_stream;
+    eprintln!("xsynth-realtime: audio stream redirected to default output device");
+
+    Ok(())
 }
 
 impl Drop for RealtimeSynth {
