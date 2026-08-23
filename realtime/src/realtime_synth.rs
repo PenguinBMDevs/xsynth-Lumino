@@ -166,7 +166,10 @@ struct PreparedRealtimeChannels {
 /// 由 UI 线程写入、各通道独立音频线程读取，使用 `AtomicU32` 无锁访问
 /// （以位模式存储 `f32`，避免对 `AtomicF32` 可用性的依赖）。
 /// 索引 = MIDI 通道号（0..channel_count）。
-struct ChannelMix {
+///
+/// 设为 `pub` 以便上层（如 lumino `XSynth` 后端）在 `RealtimeSynth` 之外
+/// 通过共享句柄设置每通道增益/声像。
+pub struct ChannelMix {
     gain: AtomicU32,
     pan: AtomicU32,
 }
@@ -404,6 +407,15 @@ impl RealtimeSynth {
             m.pan
                 .store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
+    }
+
+    /// 获取混音参数共享句柄（重建稳定的 `Arc<Vec<ChannelMix>>` 克隆引用）。
+    ///
+    /// 上层（如 lumino `XSynth` 后端）借此在 `RealtimeSynth` 之外设置每通道增益/声像，
+    /// 数据流与 `sender_shared` 一致：句柄本身（外层 `Arc`）稳定，
+    /// 重建时替换为新的内层 `Vec<ChannelMix>`，已创建的连接自动跟随。
+    pub fn clone_channel_mix(&self) -> Arc<Vec<ChannelMix>> {
+        Arc::clone(&self.channel_mix)
     }
 
     /// Pauses the playback of the audio output device.
