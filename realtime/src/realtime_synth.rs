@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
@@ -161,6 +161,33 @@ struct PreparedRealtimeChannels {
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
 
+/// 每通道音频域混音状态：增益（线性，1.0 = 0 dB）与声像（-1..1，0 = 居中）。
+///
+/// 由 UI 线程写入、各通道独立音频线程读取，使用 `AtomicU32` 无锁访问
+/// （以位模式存储 `f32`，避免对 `AtomicF32` 可用性的依赖）。
+/// 索引 = MIDI 通道号（0..channel_count）。
+struct ChannelMix {
+    gain: AtomicU32,
+    pan: AtomicU32,
+}
+
+/// 对立体声交织缓冲 `[L, R, L, R, …]` 施加音频域增益与等功率声像。
+///
+/// - `gain`：线性增益（1.0 = 0 dB），负数按 0 处理。
+/// - `pan`：声像，-1=全左、0=居中、1=全右（等功率分配）。
+fn apply_channel_mix(buf: &mut [f32], gain: f32, pan: f32) {
+    let gain = gain.max(0.0);
+    let pan = pan.clamp(-1.0, 1.0);
+    let left = ((1.0 - pan) * 0.5f32).sqrt() * gain;
+    let right = ((1.0 + pan) * 0.5f32).sqrt() * gain;
+    for i in (0..buf.len()).step_by(2) {
+        buf[i] *= left;
+        if i + 1 < buf.len() {
+            buf[i + 1] *= right;
+        }
+    }
+}
+
 /// A realtime MIDI synthesizer using an audio device for output.
 pub struct RealtimeSynth {
     data: Option<RealtimeSynthThreadSharedData>,
@@ -170,6 +197,9 @@ pub struct RealtimeSynth {
     stats: RealtimeSynthStats,
 
     stream_params: AudioStreamParams,
+
+    /// 每通道音频域混音状态（增益/声像），索引 = MIDI 通道号。
+    channel_mix: Arc<Vec<ChannelMix>>,
 
     /// 自愈重定向失败通知（err_fn 触发 RestartSelf 失败时由 stream owner 线程发送）
     recovery_rx: crossbeam_channel::Receiver<StreamRestartError>,
@@ -241,6 +271,17 @@ impl RealtimeSynth {
         let channel_pool = build_channel_pool(config.multithreading)?;
         let channel_count = channel_count(config.format);
 
+        // 每通道音频域混音状态（增益/声像），索引 = MIDI 通道号。
+        // 同一 Arc 同时由 RealtimeSynth（UI 写）与各通道线程（读）共享。
+        let channel_mix = Arc::new(
+            (0..channel_count)
+                .map(|_| ChannelMix {
+                    gain: AtomicU32::new(1.0f32.to_bits()),
+                    pan: AtomicU32::new(0.0f32.to_bits()),
+                })
+                .collect::<Vec<_>>(),
+        );
+
         let PreparedRealtimeChannels {
             channel_stats,
             senders,
@@ -253,6 +294,7 @@ impl RealtimeSynth {
             stream_params,
             channel_pool,
             config.format,
+            channel_mix.clone(),
         )?;
 
         let stats = RealtimeSynthStats::new();
@@ -290,6 +332,7 @@ impl RealtimeSynth {
 
             stats,
             stream_params,
+            channel_mix,
             recovery_rx,
         })
     }
@@ -343,6 +386,24 @@ impl RealtimeSynth {
     /// Returns the stream parameters of the audio output device.
     pub fn stream_params(&self) -> AudioStreamParams {
         self.stream_params
+    }
+
+    /// 设置某 MIDI 通道的音频域增益（线性，1.0 = 0 dB）。
+    ///
+    /// 由 UI 线程调用；对应通道的音频线程在下一渲染块读取并平滑应用。
+    /// 越界通道静默忽略。
+    pub fn set_channel_gain(&self, channel: u8, gain: f32) {
+        if let Some(m) = self.channel_mix.get(channel as usize) {
+            m.gain.store(gain.max(0.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// 设置某 MIDI 通道的音频域声像（-1..1，0 = 居中）。
+    pub fn set_channel_pan(&self, channel: u8, pan: f32) {
+        if let Some(m) = self.channel_mix.get(channel as usize) {
+            m.pan
+                .store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
     }
 
     /// Pauses the playback of the audio output device.
@@ -441,6 +502,7 @@ fn prepare_channels(
     stream_params: AudioStreamParams,
     channel_pool: Option<Arc<rayon::ThreadPool>>,
     format: SynthFormat,
+    channel_mix: Arc<Vec<ChannelMix>>,
 ) -> Result<PreparedRealtimeChannels, RealtimeSynthError> {
     let (output_sender, output_receiver) = bounded::<Vec<f32>>(channel_count as usize);
 
@@ -449,7 +511,7 @@ fn prepare_channels(
     let mut command_senders = Vec::new();
     let mut join_handles = Vec::new();
 
-    for _ in 0..channel_count {
+    for i in 0..channel_count {
         let channel = VoiceChannel::new(init_options, stream_params, channel_pool.clone());
         channel_stats.push(channel.get_channel_stats());
 
@@ -460,8 +522,14 @@ fn prepare_channels(
         command_senders.push(command_sender);
 
         let output_sender = output_sender.clone();
-        let join_handle =
-            spawn_channel_thread(channel, event_receiver, command_receiver, output_sender)?;
+        let join_handle = spawn_channel_thread(
+            channel,
+            i as u8,
+            channel_mix.clone(),
+            event_receiver,
+            command_receiver,
+            output_sender,
+        )?;
         join_handles.push(join_handle);
     }
 
@@ -482,22 +550,45 @@ fn prepare_channels(
 
 fn spawn_channel_thread(
     mut channel: VoiceChannel,
+    channel_index: u8,
+    mix: Arc<Vec<ChannelMix>>,
     event_receiver: crossbeam_channel::Receiver<ChannelEvent>,
     command_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
-        .spawn(move || loop {
-            channel.push_events_iter(event_receiver.try_iter());
-            let mut vec = match command_receiver.recv() {
-                Ok(vec) => vec,
-                Err(_) => break,
-            };
-            channel.push_events_iter(event_receiver.try_iter());
-            channel.read_samples(&mut vec);
-            if output_sender.send(vec).is_err() {
-                break;
+        .spawn(move || {
+            // 当前增益/声像：向 UI 设定的目标平滑逼近，避免拖动产生 zipper noise。
+            let mut cur_gain = 1.0f32;
+            let mut cur_pan = 0.0f32;
+            loop {
+                channel.push_events_iter(event_receiver.try_iter());
+                let mut vec = match command_receiver.recv() {
+                    Ok(vec) => vec,
+                    Err(_) => break,
+                };
+                channel.push_events_iter(event_receiver.try_iter());
+                channel.read_samples(&mut vec);
+                // 音频域混音：立体声交织缓冲施加增益 + 等功率声像。
+                let tgt_gain = f32::from_bits(
+                    mix[channel_index as usize]
+                        .gain
+                        .load(Ordering::Relaxed),
+                )
+                .max(0.0);
+                let tgt_pan = f32::from_bits(
+                    mix[channel_index as usize]
+                        .pan
+                        .load(Ordering::Relaxed),
+                )
+                .clamp(-1.0, 1.0);
+                cur_gain += (tgt_gain - cur_gain) * 0.25;
+                cur_pan += (tgt_pan - cur_pan) * 0.25;
+                apply_channel_mix(&mut vec, cur_gain, cur_pan);
+                if output_sender.send(vec).is_err() {
+                    break;
+                }
             }
         })
         .map_err(RealtimeSynthError::ChannelThreadSpawn)
@@ -793,11 +884,42 @@ fn calculate_render_size(sample_rate: u32, buffer_ms: f64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::RealtimeSynth;
+    use super::{apply_channel_mix, RealtimeSynth};
 
     #[test]
     fn realtime_synth_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RealtimeSynth>();
+    }
+
+    #[test]
+    fn apply_channel_mix_gain_and_pan() {
+        // 立体声交织 [L,R,L,R]；增益 1、声像居中 → 不变
+        let mut buf = vec![1.0, 1.0, 1.0, 1.0];
+        apply_channel_mix(&mut buf, 1.0, 0.0);
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-5 && (buf[1] - 1.0).abs() < 1e-5,
+            "居中增益1应不变: {buf:?}"
+        );
+
+        // 全左 → 右声道归零，左声道保持
+        let mut buf = vec![1.0, 1.0, 1.0, 1.0];
+        apply_channel_mix(&mut buf, 1.0, -1.0);
+        assert!((buf[0] - 1.0).abs() < 1e-5, "全左时左声道应保持: {buf:?}");
+        assert!(buf[1].abs() < 1e-5, "全左时右声道应归零: {buf:?}");
+
+        // 全右 + 增益 2 → 左归零，右声道 = 2
+        let mut buf = vec![1.0, 1.0, 1.0, 1.0];
+        apply_channel_mix(&mut buf, 2.0, 1.0);
+        assert!((buf[1] - 2.0).abs() < 1e-5, "全右时右声道应为增益: {buf:?}");
+        assert!(buf[0].abs() < 1e-5, "全右时左声道应归零: {buf:?}");
+
+        // 增益 0 → 全静音
+        let mut buf = vec![1.0, 1.0, 1.0, 1.0];
+        apply_channel_mix(&mut buf, 0.0, 0.5);
+        assert!(
+            buf.iter().all(|&v| v.abs() < 1e-5),
+            "增益0应全静音: {buf:?}"
+        );
     }
 }
