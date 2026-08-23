@@ -170,8 +170,8 @@ struct PreparedRealtimeChannels {
 /// 设为 `pub` 以便上层（如 lumino `XSynth` 后端）在 `RealtimeSynth` 之外
 /// 通过共享句柄设置每通道增益/声像。
 pub struct ChannelMix {
-    gain: AtomicU32,
-    pan: AtomicU32,
+    pub gain: AtomicU32,
+    pub pan: AtomicU32,
 }
 
 /// 对立体声交织缓冲 `[L, R, L, R, …]` 施加音频域增益与等功率声像。
