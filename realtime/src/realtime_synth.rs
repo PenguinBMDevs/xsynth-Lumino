@@ -172,6 +172,27 @@ struct PreparedRealtimeChannels {
 pub struct ChannelMix {
     pub gain: AtomicU32,
     pub pan: AtomicU32,
+    /// 每通道实时响度峰值（振幅，0..≈1；超过 1 表示接近/超过削波）。
+    ///
+    /// 由对应通道音频线程在每个渲染块测量并写入（读取上一块峰值做衰减，
+    /// 再与当前块峰值取大，形成回落型 VU），UI 线程经共享句柄无锁读取。
+    /// 索引 = MIDI 通道号（0..channel_count）。
+    pub peak: AtomicU32,
+}
+
+/// 每渲染块峰值衰减系数：用于让电平表平滑回落（约数百毫秒级）。
+const PEAK_DECAY: f32 = 0.90;
+
+/// 计算缓冲中样本绝对值的最大值（峰值振幅）。
+fn max_abs(buf: &[f32]) -> f32 {
+    let mut p = 0.0f32;
+    for &s in buf {
+        let a = s.abs();
+        if a > p {
+            p = a;
+        }
+    }
+    p
 }
 
 /// 对立体声交织缓冲 `[L, R, L, R, …]` 施加音频域增益与等功率声像。
@@ -203,6 +224,9 @@ pub struct RealtimeSynth {
 
     /// 每通道音频域混音状态（增益/声像），索引 = MIDI 通道号。
     channel_mix: Arc<Vec<ChannelMix>>,
+
+    /// 主输出实时响度峰值（共享句柄，渲染管线写入、UI 经 `clone_master_peak` 读取）。
+    master_peak: Arc<AtomicU32>,
 
     /// 自愈重定向失败通知（err_fn 触发 RestartSelf 失败时由 stream owner 线程发送）
     recovery_rx: crossbeam_channel::Receiver<StreamRestartError>,
@@ -281,9 +305,13 @@ impl RealtimeSynth {
                 .map(|_| ChannelMix {
                     gain: AtomicU32::new(1.0f32.to_bits()),
                     pan: AtomicU32::new(0.0f32.to_bits()),
+                    peak: AtomicU32::new(0.0f32.to_bits()),
                 })
                 .collect::<Vec<_>>(),
         );
+
+        // 主输出实时响度峰值（与通道峰值同语义），由渲染管线汇总后写入。
+        let master_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
         let PreparedRealtimeChannels {
             channel_stats,
@@ -308,6 +336,7 @@ impl RealtimeSynth {
             output_receiver,
             channel_stats,
             &stats,
+            master_peak.clone(),
         );
         let buffered = Arc::new(Mutex::new(
             BufferedRenderer::new(
@@ -336,6 +365,7 @@ impl RealtimeSynth {
             stats,
             stream_params,
             channel_mix,
+            master_peak,
             recovery_rx,
         })
     }
@@ -416,6 +446,14 @@ impl RealtimeSynth {
     /// 重建时替换为新的内层 `Vec<ChannelMix>`，已创建的连接自动跟随。
     pub fn clone_channel_mix(&self) -> Arc<Vec<ChannelMix>> {
         Arc::clone(&self.channel_mix)
+    }
+
+    /// 获取主输出实时响度峰值的共享句柄（重建稳定的 `Arc<AtomicU32>` 克隆引用）。
+    ///
+    /// 上层（如 lumino `XSynth` 后端）借此在 `RealtimeSynth` 之外读取主输出电平，
+    /// 与 `clone_channel_mix` 同生命周期语义：句柄外层 `Arc` 稳定，重建时跟随新管线。
+    pub fn clone_master_peak(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.master_peak)
     }
 
     /// Pauses the playback of the audio output device.
@@ -583,21 +621,26 @@ fn spawn_channel_thread(
                 channel.push_events_iter(event_receiver.try_iter());
                 channel.read_samples(&mut vec);
                 // 音频域混音：立体声交织缓冲施加增益 + 等功率声像。
-                let tgt_gain = f32::from_bits(
-                    mix[channel_index as usize]
-                        .gain
-                        .load(Ordering::Relaxed),
-                )
-                .max(0.0);
-                let tgt_pan = f32::from_bits(
-                    mix[channel_index as usize]
-                        .pan
-                        .load(Ordering::Relaxed),
-                )
-                .clamp(-1.0, 1.0);
+                let tgt_gain =
+                    f32::from_bits(mix[channel_index as usize].gain.load(Ordering::Relaxed))
+                        .max(0.0);
+                let tgt_pan =
+                    f32::from_bits(mix[channel_index as usize].pan.load(Ordering::Relaxed))
+                        .clamp(-1.0, 1.0);
                 cur_gain += (tgt_gain - cur_gain) * 0.25;
                 cur_pan += (tgt_pan - cur_pan) * 0.25;
                 apply_channel_mix(&mut vec, cur_gain, cur_pan);
+                // 实时响度峰值：读取上一块峰值做衰减，与当前块峰值取大（回落型 VU）。
+                let peak_slot = &mix[channel_index as usize].peak;
+                let prev = f32::from_bits(peak_slot.load(Ordering::Relaxed));
+                let new_peak = prev * PEAK_DECAY;
+                let block_peak = max_abs(&vec);
+                let peak = if block_peak > new_peak {
+                    block_peak
+                } else {
+                    new_peak
+                };
+                peak_slot.store(peak.to_bits(), Ordering::Relaxed);
                 if output_sender.send(vec).is_err() {
                     break;
                 }
@@ -613,6 +656,7 @@ fn build_render_pipe(
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     stats: &RealtimeSynthStats,
+    master_peak: Arc<AtomicU32>,
 ) -> FunctionAudioPipe<impl FnMut(&mut [f32]) + Send> {
     let mut vec_cache: VecDeque<Vec<f32>> = VecDeque::new();
     for _ in 0..channel_count {
@@ -633,6 +677,18 @@ fn build_render_pipe(
             sum_simd(&buf, out);
             vec_cache.push_front(buf);
         }
+
+        // 主输出实时响度峰值：汇总后的 `out` 即最终混音（限幅前），
+        // 同通道峰值做衰减 + 取大。
+        let prev = f32::from_bits(master_peak.load(Ordering::Relaxed));
+        let new_peak = prev * PEAK_DECAY;
+        let block_peak = max_abs(out);
+        let peak = if block_peak > new_peak {
+            block_peak
+        } else {
+            new_peak
+        };
+        master_peak.store(peak.to_bits(), Ordering::Relaxed);
 
         let total_voices = channel_stats.iter().map(|c| c.voice_count()).sum();
         total_voice_count.store(total_voices, Ordering::SeqCst);
@@ -828,9 +884,7 @@ fn restart_stream(
         restart_notify.clone(),
     ) {
         Ok(stream) => stream,
-        Err(RealtimeSynthError::BuildStream(err)) => {
-            return Err(StreamRestartError::Build(err))
-        }
+        Err(RealtimeSynthError::BuildStream(err)) => return Err(StreamRestartError::Build(err)),
         Err(RealtimeSynthError::UnsupportedSampleFormat(fmt)) => {
             return Err(StreamRestartError::UnsupportedSampleFormat(fmt))
         }
