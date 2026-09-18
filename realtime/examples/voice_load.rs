@@ -173,8 +173,30 @@ fn run_stream(args: &[String]) {
     let mut peak_load: f64 = 0.0;
     let mut sum_load = 0.0;
     let mut n_samples = 0u32;
+    // 可选：BURST=N 在 t≈2s 注入 N 个瞬时 NoteOn（模拟洪峰/seek 补发）。
+    let burst: u64 = std::env::var("BURST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut burst_done = false;
 
     while idx < events.len() {
+        if !burst_done && burst > 0 && start.elapsed() >= Duration::from_secs(2) {
+            let t0 = std::time::Instant::now();
+            for i in 0..burst {
+                let key = 30u8 + (i % 60) as u8;
+                sender.send_event(SynthEvent::Channel(
+                    0,
+                    ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel: 64 }),
+                ));
+            }
+            eprintln!(
+                "[stream-bench] BURST {} events injected in {:.3}s",
+                burst,
+                t0.elapsed().as_secs_f64()
+            );
+            burst_done = true;
+        }
         let elapsed_samples = start.elapsed().as_secs_f64() * sr;
         while idx < events.len() && (events[idx].0 as f64) <= elapsed_samples {
             let (_, kind, ch, key, vel) = events[idx];
