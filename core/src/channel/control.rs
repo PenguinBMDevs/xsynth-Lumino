@@ -42,6 +42,10 @@ impl ValueLerp {
 pub(super) struct ControlEventData {
     selected_lsb: i8,
     selected_msb: i8,
+    /// 当前数据入口（CC6/CC38）是否落在 NRPN 上。
+    /// RPN/NRPN 是独立命名空间（MIDI 规范）：NRPN 选中期间的数据必须被消费
+    /// 丢弃，绝不能落到上一次 RPN 选择上（否则会把 NRPN 的值写进弯音灵敏度等）。
+    nrpn_selected: bool,
     pitch_bend_sensitivity_lsb: u8,
     pitch_bend_sensitivity_msb: u8,
     pitch_bend_sensitivity: f32,
@@ -62,12 +66,14 @@ impl ControlEventData {
         ControlEventData {
             selected_lsb: -1,
             selected_msb: -1,
+            nrpn_selected: false,
             pitch_bend_sensitivity_lsb: 0,
             pitch_bend_sensitivity_msb: 2,
             pitch_bend_sensitivity: 2.0,
             pitch_bend_value: 0.0,
             fine_tune_lsb: 0,
-            fine_tune_msb: 0,
+            // 标准 14-bit 微调的中心（8192 = 0 cents）。
+            fine_tune_msb: 64,
             fine_tune_value: 0.0,
             coarse_tune_value: 0.0,
             volume: ValueLerp::new(1.0, sample_rate),
@@ -89,18 +95,28 @@ impl VoiceChannel {
                     // Bank select
                     self.params.set_bank(value);
                 }
+                0x62 | 0x63 => {
+                    // CC98/CC99: NRPN 选择（NRPN 命名空间）。
+                    // 本合成器未实现任何 NRPN 效果：NRPN 选中期间的数据入口
+                    // 必须被消费丢弃，不能落到上一次 RPN 选择上。
+                    self.control_event_data.nrpn_selected = true;
+                }
                 0x64 => {
+                    // CC100: RPN LSB（MIDI 规范）。
                     self.control_event_data.selected_lsb = value as i8;
+                    self.control_event_data.nrpn_selected = false;
                 }
                 0x65 => {
+                    // CC101: RPN MSB（MIDI 规范）。
                     self.control_event_data.selected_msb = value as i8;
+                    self.control_event_data.nrpn_selected = false;
                 }
                 0x06 | 0x26 => {
-                    let (lsb, msb) = {
+                    let (lsb, msb, nrpn) = {
                         let data = &self.control_event_data;
-                        (data.selected_lsb, data.selected_msb)
+                        (data.selected_lsb, data.selected_msb, data.nrpn_selected)
                     };
-                    if msb == 0 {
+                    if !nrpn && msb == 0 {
                         match lsb {
                             0 => {
                                 // Pitch
@@ -116,8 +132,9 @@ impl VoiceChannel {
 
                                 let sensitivity = {
                                     let data = &self.control_event_data;
+                                    // 128 精度：LSB 为 1/128 半音（与 GPU 引擎一致）。
                                     (data.pitch_bend_sensitivity_msb as f32)
-                                        + (data.pitch_bend_sensitivity_lsb as f32) / 100.0
+                                        + (data.pitch_bend_sensitivity_lsb as f32) / 128.0
                                 };
 
                                 self.process_control_event(ControlEvent::PitchBendSensitivity(
@@ -131,10 +148,12 @@ impl VoiceChannel {
                                     0x26 => self.control_event_data.fine_tune_lsb = value,
                                     _ => (),
                                 }
+                                // 标准 14-bit 微调：MSB 高 7 位、LSB 低 7 位，
+                                // 中心 8192 = 0 cents，范围 ±100 cents（与 GPU 引擎一致）。
                                 let val: u16 = ((self.control_event_data.fine_tune_msb as u16)
-                                    << 6)
-                                    + self.control_event_data.fine_tune_lsb as u16;
-                                let val = (val as f32 - 4096.0) / 4096.0 * 100.0;
+                                    << 7)
+                                    | self.control_event_data.fine_tune_lsb as u16;
+                                let val = (val as f32 - 8192.0) / 8192.0 * 100.0;
                                 self.process_control_event(ControlEvent::FineTune(val));
                             }
                             2 if controller == 0x06 => {
