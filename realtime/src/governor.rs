@@ -23,6 +23,22 @@ const WATCHDOG_KEEP_PER_KEY: usize = 16;
 /// 软目标下限（防止小量程下目标为 0）。
 const MIN_SOFT: f64 = 128.0;
 
+// ── 负载自适应目标（限速 + 迟滞 + 地坂；防止旧版"塌缩/自激"重演）──
+/// 负载高于此值并持续 `SHRINK_AFTER_BLOCKS` 才允许收缩目标。
+const ADAPT_HI: f64 = 0.90;
+/// 负载低于此值并持续 `RECOVER_AFTER_BLOCKS` 才允许恢复目标。
+const ADAPT_LO: f64 = 0.60;
+/// 持续超限多少块后开始收缩（≈200ms）。
+const SHRINK_AFTER_BLOCKS: u64 = 20;
+/// 收缩速率：每块最多 ×0.99（≈1%/块，几百毫秒量级平滑收敛）。
+const SHRINK_PER_BLOCK: f64 = 0.99;
+/// 持续轻载多少块后开始恢复（≈1s）。
+const RECOVER_AFTER_BLOCKS: u64 = 100;
+/// 恢复速率：每块 ×1.002（慢恢复，避免抖动）。
+const RECOVER_PER_BLOCK: f64 = 1.002;
+/// 目标地坂 = 名义目标的 5%（不至于把目标压到无输出）。
+const FLOOR_FRACTION: f64 = 0.05;
+
 /// 单块治理动作（由渲染管线执行）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GovernorAction {
@@ -41,13 +57,17 @@ pub struct GovernorAction {
 /// 声部治理器。
 #[derive(Debug, Clone)]
 pub struct Governor {
-    hard_max: usize,
-    ratio: f64,
     v_soft: f64,
+    /// 名义目标 `ratio × hard_max`（自适应上限）。
+    nominal: f64,
     load_ema: f64,
     /// 当前降级等级 0..=4（诊断）。
     pub level: u8,
     overload_blocks: u64,
+    /// 负载持续高于 ADAPT_HI 的块数。
+    over_hi_blocks: u64,
+    /// 负载持续低于 ADAPT_LO 的块数。
+    under_lo_blocks: u64,
 }
 
 impl Governor {
@@ -55,13 +75,15 @@ impl Governor {
     pub fn new(hard_max: usize, ratio: f64) -> Self {
         let hard_max = hard_max.max(MIN_SOFT as usize);
         let ratio = ratio.clamp(0.3, 0.95);
+        let nominal = ratio * hard_max as f64;
         Self {
-            hard_max,
-            ratio,
-            v_soft: ratio * hard_max as f64,
+            v_soft: nominal,
+            nominal,
             load_ema: 0.0,
             level: 0,
             overload_blocks: 0,
+            over_hi_blocks: 0,
+            under_lo_blocks: 0,
         }
     }
 
@@ -97,8 +119,27 @@ impl Governor {
             0
         };
 
-        // 目标固定，不随负载漂移（防自激）。
-        self.v_soft = self.ratio * self.hard_max as f64;
+        // 目标自适应（限速 + 迟滞 + 地坂）：
+        // 持续轻度过载（>0.90 达 200ms）时缓慢收缩目标——即"宁可多切旧声部，
+        // 也不让渲染超时"；持续轻载（<0.60 达 1s）时缓慢恢复。
+        // 与旧版"每块 25% 塌缩"的本质区别：速率受限、有地坂、需持续条件，
+        // 且收缩通过入场预算生效（抢旧不丢新），不会引发抢占成本自激。
+        if self.load_ema > ADAPT_HI {
+            self.over_hi_blocks += 1;
+            self.under_lo_blocks = 0;
+        } else if self.load_ema < ADAPT_LO {
+            self.under_lo_blocks += 1;
+            self.over_hi_blocks = 0;
+        } else {
+            self.over_hi_blocks = 0;
+            self.under_lo_blocks = 0;
+        }
+        let floor = (self.nominal * FLOOR_FRACTION).max(MIN_SOFT);
+        if self.over_hi_blocks >= SHRINK_AFTER_BLOCKS {
+            self.v_soft = (self.v_soft * SHRINK_PER_BLOCK).max(floor);
+        } else if self.under_lo_blocks >= RECOVER_AFTER_BLOCKS {
+            self.v_soft = (self.v_soft * RECOVER_PER_BLOCK).min(self.nominal);
+        }
 
         // 超目标即硬移除：单块最多移除 1/4 总声部（收敛快且工作量有界）。
         let deficit = (total_voices as f64 - self.v_soft).max(0.0);
@@ -117,11 +158,13 @@ impl Governor {
         }
     }
 
-    /// 看门狗触发后重置诊断状态（软目标本身固定，无需恢复）。
+    /// 看门狗触发后重置诊断状态（自适应目标保留当前值继续收敛）。
     pub fn reset_after_watchdog(&mut self) {
         self.load_ema = 0.0;
         self.level = 0;
         self.overload_blocks = 0;
+        self.over_hi_blocks = 0;
+        self.under_lo_blocks = 0;
     }
 }
 
@@ -130,14 +173,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_is_fixed_at_ratio_of_hard_max() {
+    fn transient_overload_does_not_shrink_target() {
         let mut g = Governor::new(10_000, 1.0 - 1.0 / std::f64::consts::E);
         assert!((g.v_soft() - 6320.0).abs() < 2.0);
-        // 连续过载也不得漂移（防自激的关键回归）。
-        for _ in 0..1000 {
-            g.update(8.0, 50_000, false);
+        // 短尖峰（< SHRINK_AFTER_BLOCKS）：不得收缩。
+        for _ in 0..SHRINK_AFTER_BLOCKS - 1 {
+            g.update(3.0, 50_000, false);
         }
-        assert!((g.v_soft() - 6320.0).abs() < 2.0, "v_soft={}", g.v_soft());
+        assert!(
+            (g.v_soft() - 6320.0).abs() < 2.0,
+            "瞬时尖峰不得收缩: {}",
+            g.v_soft()
+        );
+    }
+
+    #[test]
+    fn sustained_overload_shrinks_slowly_then_recovers() {
+        let mut g = Governor::new(10_000, 0.632);
+        for _ in 0..600 {
+            g.update(1.2, 50_000, false);
+        }
+        let shrunk = g.v_soft();
+        assert!(shrunk < 6320.0 && shrunk >= 300.0, "shrunk={shrunk}");
+        // 持续轻载：缓慢恢复到名义目标。
+        for _ in 0..3000 {
+            g.update(0.2, 0, false);
+        }
+        assert!((g.v_soft() - 6320.0).abs() < 2.0, "应恢复: {}", g.v_soft());
     }
 
     #[test]
