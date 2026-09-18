@@ -268,20 +268,19 @@ impl VoiceBuffer {
     pub fn remove_ended_voices(&mut self) {
         self.block_index = self.block_index.saturating_add(1);
         let now = self.block_index;
-        let mut removed = 0isize;
-        let mut i = 0;
-        while i < self.buffer.len() {
-            let deadline_expired = self.buffer[i]
-                .kill_deadline
-                .is_some_and(|deadline| now >= deadline);
-            if self.buffer[i].ended() || deadline_expired {
-                self.buffer.remove(i);
-                removed += 1;
-            } else {
-                i += 1;
+        // 单趟重建：避免 `VecDeque::remove(i)` 在长缓冲上反复搬移导致 O(n^2)。
+        // 保留原有顺序（最老在前），硬抢占/看门狗语义不变。
+        let old_len = self.buffer.len();
+        let mut alive = VecDeque::with_capacity(old_len);
+        for group in self.buffer.drain(..) {
+            let deadline_expired = group.kill_deadline.is_some_and(|deadline| now >= deadline);
+            if !(group.ended() || deadline_expired) {
+                alive.push_back(group);
             }
         }
-        self.adjust_counter(-removed);
+        let removed = old_len - alive.len();
+        self.buffer = alive;
+        self.adjust_counter(-(removed as isize));
     }
 
     // pub fn iter_voices<'a>(&'a self) -> impl Iterator<Item = &Box<dyn Voice>> + 'a {

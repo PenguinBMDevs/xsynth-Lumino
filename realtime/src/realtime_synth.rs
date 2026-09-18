@@ -172,8 +172,10 @@ struct PreparedRealtimeChannels {
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     senders: Vec<crossbeam_channel::Sender<ChannelEvent>>,
     command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
-    /// 每通道的 NoteOn 入场预算（软目标按活跃通道均分，管道每块更新）。
+    /// 每通道的 NoteOn 入场预算（软目标按通道数均分，管道每块更新）。
     admission_targets: Vec<Arc<AtomicU64>>,
+    /// 每通道当前被推迟（超预算）的 NoteOn 数量（诊断）。
+    admission_deferred: Vec<Arc<AtomicU64>>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -335,6 +337,7 @@ impl RealtimeSynth {
             senders,
             command_senders,
             admission_targets,
+            admission_deferred,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -360,6 +363,7 @@ impl RealtimeSynth {
             output_receiver,
             channel_stats,
             admission_targets,
+            admission_deferred,
             &stats,
             master_peak.clone(),
             hard_max_voices,
@@ -593,6 +597,7 @@ fn prepare_channels(
     let mut senders = Vec::new();
     let mut command_senders = Vec::new();
     let mut admission_targets = Vec::new();
+    let mut admission_deferred = Vec::new();
     let mut join_handles = Vec::new();
 
     for i in 0..channel_count {
@@ -608,6 +613,8 @@ fn prepare_channels(
         // 入场预算初始为无限制，首块渲染前由管道写入真实值。
         let admission_target = Arc::new(AtomicU64::new(u64::MAX));
         admission_targets.push(admission_target.clone());
+        let deferred_len = Arc::new(AtomicU64::new(0));
+        admission_deferred.push(deferred_len.clone());
 
         let output_sender = output_sender.clone();
         let join_handle = spawn_channel_thread(
@@ -618,6 +625,7 @@ fn prepare_channels(
             command_receiver,
             output_sender,
             admission_target,
+            deferred_len,
         )?;
         join_handles.push(join_handle);
     }
@@ -633,14 +641,10 @@ fn prepare_channels(
         senders,
         command_senders,
         admission_targets,
+        admission_deferred,
         join_handles,
         output_receiver,
     })
-}
-
-/// 判断事件是否为 NoteOn（仅 NoteOn 参与入场预算）。
-fn is_note_on(event: &ChannelEvent) -> bool {
-    matches!(event, ChannelEvent::Audio(ChannelAudioEvent::NoteOn { .. }))
 }
 
 fn spawn_channel_thread(
@@ -651,6 +655,7 @@ fn spawn_channel_thread(
     command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
     admission_target: Arc<AtomicU64>,
+    deferred_len: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -661,29 +666,25 @@ fn spawn_channel_thread(
 
             let stats = channel.get_channel_stats();
 
-            // 入场控制（admission control）：把本通道声部数补到 `admission_target`
-            // 为止，超预算的 NoteOn 推迟到后续块（留在队列里，不丢弃）。
-            //
-            // 关键点：遇到第一个超预算的 NoteOn 就停止从队列取后续事件，严格保持
-            // 事件顺序（否则 NoteOff 可能先于对应 NoteOn 到达，导致挂音）。
-            //
-            // 这从结构上封死了"长块 → 事件积压 → 下一块全量注入 → 更长块"的雪崩。
-            let mut pending: VecDeque<ChannelEvent> = VecDeque::new();
+            // 入场控制（admission control）：
+            // - 预算内直通 NoteOn；超预算的 NoteOn 进入 `deferred`（推迟，不丢弃）；
+            // - **NoteOff 永远直通**：若队列里存有同键待播 NoteOn，则配对取消
+            //   （该音符从未发声，不应再发 NoteOff），否则正常下发。
+            //   这避免了"扣住 NoteOn 把后续 NoteOff 堵死 → 声部永不释放"的死锁。
+            // - 其他事件（CC/PB/Program/Config）永远直通。
+            let mut deferred: VecDeque<(u8, u8)> = VecDeque::new();
             const DRAIN_CAP: usize = 4096;
-            let admit = |channel: &mut VoiceChannel, pending: &mut VecDeque<ChannelEvent>| {
+            const DEFERRED_CAP: usize = 4096;
+            let admit = |channel: &mut VoiceChannel, deferred: &mut VecDeque<(u8, u8)>| {
                 let target = admission_target.load(Ordering::Relaxed) as usize;
-                // 先按序消化上一块被推迟的事件。
-                while let Some(event) = pending.front() {
-                    if is_note_on(event) && stats.voice_count() as usize >= target {
+                // 先补发积压 NoteOn（仅在预算内，旧者优先）。
+                while let Some(&(key, vel)) = deferred.front() {
+                    if stats.voice_count() as usize >= target {
                         break;
                     }
-                    if let Some(event) = pending.pop_front() {
-                        channel.process_event(event);
-                    }
-                }
-                // 只有 pending 清空后才继续从队列取新事件，保证整体顺序。
-                if !pending.is_empty() {
-                    return;
+                    deferred.pop_front();
+                    channel
+                        .process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }));
                 }
                 let mut drained = 0;
                 while drained < DRAIN_CAP {
@@ -691,21 +692,37 @@ fn spawn_channel_thread(
                         break;
                     };
                     drained += 1;
-                    if is_note_on(&event) && stats.voice_count() as usize >= target {
-                        pending.push_back(event);
-                        break;
+                    match &event {
+                        ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
+                            if (stats.voice_count() as usize) < target {
+                                channel.process_event(event);
+                            } else {
+                                if deferred.len() >= DEFERRED_CAP {
+                                    deferred.pop_front();
+                                }
+                                deferred.push_back((*key, *vel));
+                            }
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
+                            if let Some(pos) = deferred.iter().rposition(|(k, _)| k == key) {
+                                deferred.remove(pos);
+                            } else {
+                                channel.process_event(event);
+                            }
+                        }
+                        _ => channel.process_event(event),
                     }
-                    channel.process_event(event);
                 }
+                deferred_len.store(deferred.len() as u64, Ordering::Relaxed);
             };
 
             loop {
-                admit(&mut channel, &mut pending);
+                admit(&mut channel, &mut deferred);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut pending);
+                admit(&mut channel, &mut deferred);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -764,6 +781,7 @@ fn build_render_pipe(
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     admission_targets: Vec<Arc<AtomicU64>>,
+    admission_deferred: Vec<Arc<AtomicU64>>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
     hard_max_voices: usize,
@@ -780,24 +798,15 @@ fn build_render_pipe(
     let sample_rate = stream_params.sample_rate as f64;
     let output_channels = (stream_params.channels.count() as f64).max(1.0);
 
-    // 负载闭环治理器：运行目标 = min(ratio × 硬上限, 负载反解容量)，
-    // 硬上限只做量程，负载反馈只会让软目标更低、不会更高。
+    // 声部治理器：运行目标固定 = ratio × 硬上限（不随负载漂移，防自激）。
     let mut governor = Governor::new(hard_max_voices, voice_target_ratio);
 
     FunctionAudioPipe::new(stream_params, move |out| {
         let block_start = Instant::now();
 
-        // 入场预算：把上一块末的软目标按"活跃通道数"均分下发给各通道。
-        // 冷启动（全通道 0 声部）时按通道总数均分，避免首块每通道都拿到全额预算。
-        // 单通道文件可独享全部预算；通道侧据此限制每块注入的 NoteOn 数，
-        // 从结构上防止事件积压后的全量注入雪崩。
-        let active_channels = channel_stats.iter().filter(|c| c.voice_count() > 0).count();
-        let divisor = if active_channels == 0 {
-            channel_count as usize
-        } else {
-            active_channels
-        }
-        .max(1);
+        // 入场预算：把软目标按"通道总数"均分下发给各通道（固定除数，
+        // 保证全局上界 = 软目标；按活跃通道均分会在通道间漂移、总量失控）。
+        let divisor = (channel_count as usize).max(1);
         let share = (governor.v_soft() / divisor as f64).max(8.0) as u64;
         for target in &admission_targets {
             target.store(share, Ordering::Relaxed);
@@ -892,8 +901,26 @@ fn build_render_pipe(
                 .unwrap_or(0);
             if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 1 {
                 LAST_LOG.store(now, Ordering::Relaxed);
+                // 诊断：声部最多的 3 个通道 + 各通道最大积压 NoteOn（定位病态分布）。
+                let mut counts: Vec<(usize, u64)> = channel_stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.voice_count()))
+                    .collect();
+                counts.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+                let top = counts
+                    .iter()
+                    .take(3)
+                    .map(|(i, v)| format!("c{i}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let def_max = admission_deferred
+                    .iter()
+                    .map(|d| d.load(Ordering::Relaxed))
+                    .max()
+                    .unwrap_or(0);
                 eprintln!(
-                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={}",
+                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} top=[{}] def={}",
                     governor.level,
                     governor.load_ema(),
                     total_voices,
@@ -901,6 +928,8 @@ fn build_render_pipe(
                     action.steal,
                     action.hard_steal,
                     action.gate_active,
+                    top,
+                    def_max,
                 );
             }
         }
