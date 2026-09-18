@@ -239,6 +239,28 @@ impl VoiceBuffer {
         self.buffer.len()
     }
 
+    /// 当前活跃（未被 kill）的声部组数量。
+    pub fn active_voice_count(&self) -> usize {
+        self.buffer.iter().filter(|g| !g.is_killed()).count()
+    }
+
+    /// 释放最老的一组声部（`VecDeque` 前端 = 最早入队）。
+    ///
+    /// `fade_out_killing = true` 时走 1ms 淡出（避免爆音），
+    /// 否则立即从缓冲中移除（性能更好但可能有轻微 click）。
+    /// 返回是否有声部被释放。
+    pub fn release_oldest_voice_group(&mut self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        if self.options.fade_out_killing {
+            self.kill_voice_fade_out(0);
+        } else {
+            self.buffer.pop_front();
+        }
+        true
+    }
+
     pub fn set_damper(&mut self, damper: bool) {
         if self.damper_held && !damper {
             // Release all voices that are held by the damper

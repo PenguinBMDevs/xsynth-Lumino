@@ -58,6 +58,16 @@ pub struct ChannelInitOptions {
     ///
     /// Default: `false`
     pub fade_out_killing: bool,
+
+    /// Maximum number of active voices per channel (`None` = unlimited,
+    /// `Some(0)` is treated as unlimited too).
+    ///
+    /// When exceeded, the oldest voice groups of the busiest keys are released
+    /// first, so newly played notes keep sounding (dense black-MIDI safety
+    /// valve that keeps the render load bounded without dropping new notes).
+    ///
+    /// Default: `None`
+    pub max_voices: Option<usize>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -65,6 +75,7 @@ impl Default for ChannelInitOptions {
     fn default() -> Self {
         Self {
             fade_out_killing: false,
+            max_voices: None,
         }
     }
 }
@@ -95,6 +106,9 @@ pub struct VoiceChannel {
     threadpool: Option<Arc<rayon::ThreadPool>>,
 
     stream_params: AudioStreamParams,
+
+    /// Channel configuration (fade-out kills, per-channel voice cap).
+    options: ChannelInitOptions,
 
     /// The helper struct for keeping track of MIDI control event data
     control_event_data: ControlEventData,
@@ -137,6 +151,8 @@ impl VoiceChannel {
             threadpool,
 
             stream_params,
+
+            options,
 
             control_event_data: ControlEventData::new_defaults(stream_params.sample_rate),
             voice_control_data: VoiceControlData::new_defaults(),
@@ -192,20 +208,30 @@ impl VoiceChannel {
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
         self.params.load_program();
 
+        // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
+        for key in self.key_voices.iter_mut() {
+            for e in key.event_cache.drain(..) {
+                key.data.send_event(
+                    e,
+                    &self.voice_control_data,
+                    &self.params.channel_sf,
+                    self.params.layers,
+                );
+            }
+        }
+
+        // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
+        //    使渲染负载有上界，同时不丢刚触发的音符。
+        self.enforce_max_voices();
+
+        // 3) 渲染（可并行）。
         out.fill(0.0);
         match self.threadpool.as_ref() {
             Some(pool) => {
                 let len = out.len();
                 let key_voices = &mut self.key_voices;
-                let params = &self.params;
-                let control_data = &self.voice_control_data;
                 pool.install(|| {
                     key_voices.par_iter_mut().for_each(move |key| {
-                        for e in key.event_cache.drain(..) {
-                            key.data
-                                .send_event(e, control_data, &params.channel_sf, params.layers);
-                        }
-
                         prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
                         key.data.render_to(&mut key.audio_cache);
                     });
@@ -217,21 +243,48 @@ impl VoiceChannel {
             }
             None => {
                 for key in self.key_voices.iter_mut() {
-                    for e in key.event_cache.drain(..) {
-                        key.data.send_event(
-                            e,
-                            &self.voice_control_data,
-                            &self.params.channel_sf,
-                            self.params.layers,
-                        );
-                    }
-
                     key.data.render_to(out);
                 }
             }
         }
 
         self.apply_channel_effects(out);
+    }
+
+    /// 每通道声部上限：超过 `options.max_voices` 时，从"声部最多"的键里
+    /// 反复释放最老的一组声部（`VecDeque` 前端），直到回到上限内。
+    ///
+    /// 选择最忙的键可把抢占集中在压力最大的键上；选择最老的一组保证
+    /// 新音符（当前正在演奏）不被丢弃——避免"杀还没播放的音符"造成断续。
+    fn enforce_max_voices(&mut self) {
+        let Some(cap) = self.options.max_voices else {
+            return;
+        };
+        // 0 视为不限，避免歧义。
+        if cap == 0 {
+            return;
+        }
+
+        let mut total: usize = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.active_voice_count())
+            .sum();
+        while total > cap {
+            let Some((idx, _)) = self
+                .key_voices
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| key.data.active_voice_count() > 0)
+                .max_by_key(|(_, key)| key.data.active_voice_count())
+            else {
+                break;
+            };
+            if !self.key_voices[idx].data.release_oldest_voice_group() {
+                break;
+            }
+            total -= 1;
+        }
     }
 
     fn propagate_voice_controls(&mut self) {

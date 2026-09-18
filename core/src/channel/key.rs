@@ -90,6 +90,16 @@ impl KeyData {
         self.voices.has_voices()
     }
 
+    /// 当前活跃（未被 kill / 未结束）的声部组数量。
+    pub fn active_voice_count(&self) -> usize {
+        self.voices.active_voice_count()
+    }
+
+    /// 释放最老的一组声部（保留最新触发的音符）。返回是否有声部被释放。
+    pub fn release_oldest_voice_group(&mut self) -> bool {
+        self.voices.release_oldest_voice_group()
+    }
+
     pub fn set_damper(&mut self, damper: bool) {
         self.voices.set_damper(damper);
     }
