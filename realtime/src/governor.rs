@@ -21,7 +21,9 @@ const WATCHDOG_BLOCKS: u64 = 100;
 /// 看门狗每键保留的最新声部组数。
 const WATCHDOG_KEEP_PER_KEY: usize = 16;
 /// 软目标下限（防止收缩到 0 导致无输出）。
-const MIN_SOFT: f64 = 64.0;
+const MIN_SOFT: f64 = 128.0;
+/// 单块最大收缩比例（超出 HI 的部分按此系数缩放，防止尖峰导致塌缩）。
+const SHRINK_PER_BLOCK: f64 = 0.08;
 
 /// 单块治理动作（由渲染管线执行）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,9 +102,15 @@ impl Governor {
         };
 
         // 软目标调节：高负载快收缩，低负载慢恢复（攻快放慢 + 滞回）。
-        if self.load_ema > HI {
+        //
+        // 收缩限幅（防自激）：只有"声部确实构成压力"（V 超过软目标一半）
+        // 才收缩，且每块最多收缩 `SHRINK_PER_BLOCK`。否则初始化/事件洪峰
+        // 造成的瞬时高负载会把软目标砸到地板，进而引发"每块都在抢占 →
+        // 抢占成本又推高负载"的正反馈。
+        let voice_pressure = total_voices as f64 > self.v_soft * 0.5;
+        if self.load_ema > HI && voice_pressure {
             let excess = (self.load_ema - HI).min(1.0);
-            self.v_soft = (self.v_soft * (1.0 - 0.25 * excess)).max(MIN_SOFT);
+            self.v_soft = (self.v_soft * (1.0 - SHRINK_PER_BLOCK * excess)).max(MIN_SOFT);
         } else if self.load_ema < LO {
             self.v_soft = (self.v_soft * 1.02).min(self.ratio * self.hard_max as f64);
         }
@@ -178,6 +186,33 @@ mod tests {
         }
         assert!(saw_watchdog, "持续过载应触发看门狗");
         assert_eq!(g.level, 0);
+    }
+
+    #[test]
+    fn transient_spike_without_voice_pressure_does_not_shrink_soft_target() {
+        let mut g = Governor::new(10_000, 0.632);
+        // 初始化/事件洪峰：V=0 或远小于软目标时，即使负载爆表也不收缩。
+        for _ in 0..50 {
+            g.update(8.0, 0, false);
+        }
+        assert!(
+            (g.v_soft() - 6320.0).abs() < 1.0,
+            "空闲期不得收缩软目标: {}",
+            g.v_soft()
+        );
+    }
+
+    #[test]
+    fn sustained_overload_shrinks_gradually_not_collapses() {
+        let mut g = Governor::new(10_000, 0.632);
+        // 单块 5.0 尖峰：收缩不得超过 SHRINK_PER_BLOCK。
+        g.update(5.0, 9000, false);
+        let after_one = g.v_soft();
+        assert!(
+            after_one >= 6320.0 * (1.0 - SHRINK_PER_BLOCK - 1e-9),
+            "单块收缩超过限幅: {}",
+            after_one
+        );
     }
 
     #[test]
