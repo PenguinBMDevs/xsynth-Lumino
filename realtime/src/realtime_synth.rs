@@ -667,11 +667,16 @@ fn spawn_channel_thread(
             // - **全局预算池**（软目标 - 当前总声部数，管道每块刷新）：预算内直通
             //   NoteOn，超预算进入 `deferred`（推迟，不丢弃）。全局池保证单通道
             //   密集文件可独享整个预算，多通道文件按需竞争，且总量有上界。
-            // - **NoteOff 永远直通**：若队列里存有同键待播 NoteOn，则配对取消
-            //   （该音符从未发声，不应再发 NoteOff），否则正常下发。
-            //   这避免了"扣住 NoteOn 把后续 NoteOff 堵死 → 声部永不释放"的死锁。
+            // - **NoteOff 按"发声计数"正确配对**：键上仍有正在发声的音时，NoteOff
+            //   必须下发（否则该音永远 release 不了 → 冻结长音）；只有"从未发声"
+            //   的 deferred NoteOn 才会被 NoteOff 配对取消。
+            //   曾经这里直接"同键有 deferred 就吞 NoteOff"，在黑乐谱同键反复触发
+            //   （撞墙后 NoteOn 被 defer）时会把在响音符的 NoteOff 吃掉，造成
+            //   整段冻结/停滞——这是根因修复。
             // - 其他事件（CC/PB/Program/Config）永远直通。
             let mut deferred: VecDeque<(u8, u8)> = VecDeque::new();
+            // 每键"已下发且尚未收到 NoteOff"的音符数（FIFO 配对基准）。
+            let mut sounding = [0u32; 128];
             const DRAIN_CAP: usize = 4096;
             const DEFERRED_CAP: usize = 4096;
             // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
@@ -683,7 +688,9 @@ fn spawn_channel_thread(
                     false
                 }
             };
-            let admit = |channel: &mut VoiceChannel, deferred: &mut VecDeque<(u8, u8)>| {
+            let admit = |channel: &mut VoiceChannel,
+                         deferred: &mut VecDeque<(u8, u8)>,
+                         sounding: &mut [u32; 128]| {
                 // 先补发积压 NoteOn（旧者优先，仅在有全局预算时）。
                 while let Some(&(key, vel)) = deferred.front() {
                     if !try_acquire(&admission_budget) {
@@ -692,6 +699,7 @@ fn spawn_channel_thread(
                     deferred.pop_front();
                     channel
                         .process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }));
+                    sounding[key as usize] += 1;
                 }
                 let mut drained = 0;
                 while drained < DRAIN_CAP {
@@ -699,37 +707,68 @@ fn spawn_channel_thread(
                         break;
                     };
                     drained += 1;
-                    match &event {
+                    match event {
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
                             if try_acquire(&admission_budget) {
-                                channel.process_event(event);
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOn { key, vel },
+                                ));
+                                sounding[key as usize] += 1;
                             } else {
                                 if deferred.len() >= DEFERRED_CAP {
                                     deferred.pop_front();
                                 }
-                                deferred.push_back((*key, *vel));
+                                deferred.push_back((key, vel));
                             }
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
-                            if let Some(pos) = deferred.iter().rposition(|(k, _)| k == key) {
+                            let k = key as usize;
+                            if k < sounding.len() && sounding[k] > 0 {
+                                // 该键仍有在响音符：NoteOff 必须下发，释放对应声部。
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOff { key },
+                                ));
+                                sounding[k] -= 1;
+                            } else if let Some(pos) =
+                                deferred.iter().rposition(|(dk, _)| *dk == key)
+                            {
+                                // 键上没有在响音符时才取消"从未发声"的 deferred NoteOn。
                                 deferred.remove(pos);
                             } else {
-                                channel.process_event(event);
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOff { key },
+                                ));
                             }
                         }
-                        _ => channel.process_event(event),
+                        ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff) => {
+                            sounding.fill(0);
+                            channel
+                                .process_event(ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff));
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled) => {
+                            sounding.fill(0);
+                            channel.process_event(ChannelEvent::Audio(
+                                ChannelAudioEvent::AllNotesKilled,
+                            ));
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::SystemReset) => {
+                            sounding.fill(0);
+                            channel
+                                .process_event(ChannelEvent::Audio(ChannelAudioEvent::SystemReset));
+                        }
+                        other => channel.process_event(other),
                     }
                 }
                 deferred_len.store(deferred.len() as u64, Ordering::Relaxed);
             };
 
             loop {
-                admit(&mut channel, &mut deferred);
+                admit(&mut channel, &mut deferred, &mut sounding);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut deferred);
+                admit(&mut channel, &mut deferred, &mut sounding);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
