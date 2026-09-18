@@ -153,10 +153,20 @@ struct RealtimeSynthThreadSharedData {
     event_senders: RealtimeEventSender,
 }
 
+/// 通道线程命令。
+///
+/// - `Render`：渲染一块并送回管线（现行为）；
+/// - `Steal`：只执行声部抢占（跨通道全局上限由渲染管线统一调度），
+///   不回送音频块。
+enum ChannelCommand {
+    Render(Vec<f32>),
+    Steal(usize),
+}
+
 struct PreparedRealtimeChannels {
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     senders: Vec<crossbeam_channel::Sender<ChannelEvent>>,
-    command_senders: Vec<crossbeam_channel::Sender<Vec<f32>>>,
+    command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -337,6 +347,7 @@ impl RealtimeSynth {
             channel_stats,
             &stats,
             master_peak.clone(),
+            config.global_max_voices,
         );
         let render_size = calculate_render_size(sample_rate, config.render_window_ms).max(1);
         let cushion_samples =
@@ -567,7 +578,7 @@ fn prepare_channels(
         let (event_sender, event_receiver) = unbounded();
         senders.push(event_sender);
 
-        let (command_sender, command_receiver) = bounded::<Vec<f32>>(1);
+        let (command_sender, command_receiver) = bounded::<ChannelCommand>(1);
         command_senders.push(command_sender);
 
         let output_sender = output_sender.clone();
@@ -602,7 +613,7 @@ fn spawn_channel_thread(
     channel_index: u8,
     mix: Arc<Vec<ChannelMix>>,
     event_receiver: crossbeam_channel::Receiver<ChannelEvent>,
-    command_receiver: crossbeam_channel::Receiver<Vec<f32>>,
+    command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
@@ -613,11 +624,21 @@ fn spawn_channel_thread(
             let mut cur_pan = 0.0f32;
             loop {
                 channel.push_events_iter(event_receiver.try_iter());
-                let mut vec = match command_receiver.recv() {
-                    Ok(vec) => vec,
+                let command = match command_receiver.recv() {
+                    Ok(command) => command,
                     Err(_) => break,
                 };
                 channel.push_events_iter(event_receiver.try_iter());
+
+                let mut vec = match command {
+                    // 全局治理：只抢占声部，不渲染、不回送音频块。
+                    ChannelCommand::Steal(count) => {
+                        channel.steal_voices(count);
+                        continue;
+                    }
+                    ChannelCommand::Render(vec) => vec,
+                };
+
                 channel.read_samples(&mut vec);
                 // 音频域混音：立体声交织缓冲施加增益 + 等功率声像。
                 let tgt_gain =
@@ -651,11 +672,12 @@ fn spawn_channel_thread(
 fn build_render_pipe(
     stream_params: AudioStreamParams,
     channel_count: u32,
-    command_senders: Vec<crossbeam_channel::Sender<Vec<f32>>>,
+    command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
+    global_max_voices: Option<usize>,
 ) -> FunctionAudioPipe<impl FnMut(&mut [f32]) + Send> {
     let mut vec_cache: VecDeque<Vec<f32>> = VecDeque::new();
     for _ in 0..channel_count {
@@ -668,7 +690,7 @@ fn build_render_pipe(
         for sender in &command_senders {
             let mut buf = vec_cache.pop_front().unwrap();
             prepapre_cache_vec(&mut buf, out.len(), 0.0);
-            sender.send(buf).unwrap();
+            sender.send(ChannelCommand::Render(buf)).unwrap();
         }
 
         for _ in 0..channel_count {
@@ -689,8 +711,36 @@ fn build_render_pipe(
         };
         master_peak.store(peak.to_bits(), Ordering::Relaxed);
 
-        let total_voices = channel_stats.iter().map(|c| c.voice_count()).sum();
+        let total_voices: u64 = channel_stats.iter().map(|c| c.voice_count()).sum();
         total_voice_count.store(total_voices, Ordering::SeqCst);
+
+        // 跨通道全局声部上限：超出时向"声部最多的通道"下发抢占命令。
+        // `Steal` 命令不产生音频块，通道处理完即继续等待下一块渲染命令，
+        // 因此不会破坏本块的通道同步。
+        if let Some(cap) = global_max_voices {
+            if cap > 0 && total_voices > cap as u64 {
+                let mut deficit = total_voices - cap as u64;
+                let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
+                let mut order: Vec<usize> = (0..channel_count as usize).collect();
+                order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
+                for i in order {
+                    if deficit == 0 {
+                        break;
+                    }
+                    let take = counts[i].min(deficit);
+                    if take == 0 {
+                        continue;
+                    }
+                    if command_senders[i]
+                        .send(ChannelCommand::Steal(take as usize))
+                        .is_ok()
+                    {
+                        counts[i] -= take;
+                        deficit -= take;
+                    }
+                }
+            }
+        }
     })
 }
 

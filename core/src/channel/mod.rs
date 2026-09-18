@@ -251,6 +251,39 @@ impl VoiceChannel {
         self.apply_channel_effects(out);
     }
 
+    /// 按分级策略抢占 `count` 个活跃声部（供跨通道全局治理调用）。
+    ///
+    /// 与 `enforce_max_voices` 相同：从最忙的键、按 T1 释放中最轻 → T2 最轻
+    /// 依次抢占；实际抢占数可能小于 `count`（活跃声部不足时）。
+    pub fn steal_voices(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut counts: Vec<usize> = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.active_voice_count())
+            .collect();
+        let total: usize = counts.iter().sum();
+        let mut remaining = count.min(total);
+        while remaining > 0 {
+            let Some(idx) = counts
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count > 0)
+                .max_by_key(|(_, &count)| count)
+                .map(|(idx, _)| idx)
+            else {
+                break;
+            };
+            if self.key_voices[idx].data.steal_voice_group().is_none() {
+                break;
+            }
+            counts[idx] -= 1;
+            remaining -= 1;
+        }
+    }
+
     /// 每通道声部上限：超过 `options.max_voices` 时，从"活跃声部最多的键"里
     /// 按分级策略抢占**活跃**声部（T1 释放中最轻 → T2 最轻），直到回到上限内。
     ///

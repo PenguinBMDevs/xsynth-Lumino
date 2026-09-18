@@ -34,6 +34,17 @@ pub struct XSynthRealtimeConfig {
     /// Default: `100.0`
     pub cushion_ms: f64,
 
+    /// Maximum number of active voices summed across **all** channels
+    /// (`None` = unlimited, `Some(0)` is treated as unlimited too).
+    ///
+    /// Enforced by the render pipe: when exceeded, the busiest channels are
+    /// asked to steal their oldest/quietest/releasing voices, so newly played
+    /// notes keep sounding. This is the cross-channel counterpart of
+    /// `channel_init_options.max_voices` (which is per channel).
+    ///
+    /// Default: `None`
+    pub global_max_voices: Option<usize>,
+
     /// Defines the format that the synthesizer will use. See the `SynthFormat`
     /// documentation for more information.
     ///
@@ -69,6 +80,7 @@ impl Default for XSynthRealtimeConfig {
             channel_init_options: Default::default(),
             render_window_ms: 10.0,
             cushion_ms: 100.0,
+            global_max_voices: None,
             format: Default::default(),
             multithreading: ThreadCount::None,
             ignore_range: 0..=0,
