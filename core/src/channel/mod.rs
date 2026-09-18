@@ -256,6 +256,9 @@ impl VoiceChannel {
     ///
     /// 选择最忙的键可把抢占集中在压力最大的键上；选择最老的一组保证
     /// 新音符（当前正在演奏）不被丢弃——避免"杀还没播放的音符"造成断续。
+    ///
+    /// 性能：活跃数只统计一次（O(total)），之后在 128 个计数上增量维护
+    /// （每次抢占 O(128)），避免"每杀一个都全量重扫"导致的二次复杂度卡死。
     fn enforce_max_voices(&mut self) {
         let Some(cap) = self.options.max_voices else {
             return;
@@ -265,24 +268,30 @@ impl VoiceChannel {
             return;
         }
 
-        let mut total: usize = self
+        let mut counts: Vec<usize> = self
             .key_voices
             .iter()
             .map(|key| key.data.active_voice_count())
-            .sum();
+            .collect();
+        let mut total: usize = counts.iter().sum();
+        if total <= cap {
+            return;
+        }
+
         while total > cap {
-            let Some((idx, _)) = self
-                .key_voices
+            let Some(idx) = counts
                 .iter()
                 .enumerate()
-                .filter(|(_, key)| key.data.active_voice_count() > 0)
-                .max_by_key(|(_, key)| key.data.active_voice_count())
+                .filter(|(_, &count)| count > 0)
+                .max_by_key(|(_, &count)| count)
+                .map(|(idx, _)| idx)
             else {
                 break;
             };
             if !self.key_voices[idx].data.release_oldest_voice_group() {
                 break;
             }
+            counts[idx] -= 1;
             total -= 1;
         }
     }
