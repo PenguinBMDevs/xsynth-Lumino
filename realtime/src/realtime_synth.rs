@@ -674,11 +674,18 @@ fn spawn_channel_thread(
             //   （撞墙后 NoteOn 被 defer）时会把在响音符的 NoteOff 吃掉，造成
             //   整段冻结/停滞——这是根因修复。
             // - 其他事件（CC/PB/Program/Config）永远直通。
-            let mut deferred: VecDeque<(u8, u8)> = VecDeque::new();
+            let mut deferred: VecDeque<(u8, u8, u32)> = VecDeque::new();
             // 每键"已下发且尚未收到 NoteOff"的音符数（FIFO 配对基准）。
             let mut sounding = [0u32; 128];
             const DRAIN_CAP: usize = 4096;
-            const DEFERRED_CAP: usize = 4096;
+            const DEFERRED_CAP: usize = 1024;
+            /// 推迟 TTL（admit 调用数，每块约 2 次）：超时即丢弃。
+            ///
+            /// 实时播放优先于"补全"：撞到软目标后，若把旧音符无限推迟再补发，
+            /// 音频内容会落后进度条（听感为"一小段一小段往前蠕动"）。因此超过
+            /// 约 30ms 的积压 NoteOn 直接丢弃，保证播放始终贴近实时。
+            const DEFERRED_TTL_CALLS: u32 = 6;
+            let mut admit_clock: u32 = 0;
             // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
             let try_acquire = |budget: &AtomicI64| -> bool {
                 if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
@@ -689,10 +696,15 @@ fn spawn_channel_thread(
                 }
             };
             let admit = |channel: &mut VoiceChannel,
-                         deferred: &mut VecDeque<(u8, u8)>,
-                         sounding: &mut [u32; 128]| {
-                // 先补发积压 NoteOn（旧者优先，仅在有全局预算时）。
-                while let Some(&(key, vel)) = deferred.front() {
+                         deferred: &mut VecDeque<(u8, u8, u32)>,
+                         sounding: &mut [u32; 128],
+                         admit_clock: &mut u32| {
+                // 先补发积压 NoteOn（旧者优先）：超时者丢弃，避免播放滞后于进度。
+                while let Some(&(key, vel, inserted)) = deferred.front() {
+                    if admit_clock.wrapping_sub(inserted) > DEFERRED_TTL_CALLS {
+                        deferred.pop_front();
+                        continue;
+                    }
                     if !try_acquire(&admission_budget) {
                         break;
                     }
@@ -701,6 +713,7 @@ fn spawn_channel_thread(
                         .process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }));
                     sounding[key as usize] += 1;
                 }
+                *admit_clock = admit_clock.wrapping_add(1);
                 let mut drained = 0;
                 while drained < DRAIN_CAP {
                     let Ok(event) = event_receiver.try_recv() else {
@@ -718,7 +731,7 @@ fn spawn_channel_thread(
                                 if deferred.len() >= DEFERRED_CAP {
                                     deferred.pop_front();
                                 }
-                                deferred.push_back((key, vel));
+                                deferred.push_back((key, vel, *admit_clock));
                             }
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
@@ -730,7 +743,7 @@ fn spawn_channel_thread(
                                 ));
                                 sounding[k] -= 1;
                             } else if let Some(pos) =
-                                deferred.iter().rposition(|(dk, _)| *dk == key)
+                                deferred.iter().rposition(|(dk, _, _)| *dk == key)
                             {
                                 // 键上没有在响音符时才取消"从未发声"的 deferred NoteOn。
                                 deferred.remove(pos);
@@ -763,12 +776,12 @@ fn spawn_channel_thread(
             };
 
             loop {
-                admit(&mut channel, &mut deferred, &mut sounding);
+                admit(&mut channel, &mut deferred, &mut sounding, &mut admit_clock);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut deferred, &mut sounding);
+                admit(&mut channel, &mut deferred, &mut sounding, &mut admit_clock);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -935,14 +948,16 @@ fn build_render_pipe(
             governor.reset_after_watchdog();
         }
 
-        // 治理诊断：仅异常时低频输出（受 XSYNTH_GOV_DEBUG 控制）。
-        if governor.level > 0 && std::env::var_os("XSYNTH_GOV_DEBUG").is_some() {
+        // 治理诊断（受 XSYNTH_GOV_DEBUG 控制）：异常时 1s 一次，正常时 5s 一次，
+        // 始终输出 V/soft/def，便于观察撞墙与积压情况。
+        if std::env::var_os("XSYNTH_GOV_DEBUG").is_some() {
             static LAST_LOG: AtomicU64 = AtomicU64::new(0);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 1 {
+            let interval = if governor.level > 0 { 1 } else { 5 };
+            if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= interval {
                 LAST_LOG.store(now, Ordering::Relaxed);
                 // 诊断：声部最多的 3 个通道 + 各通道最大积压 NoteOn（定位病态分布）。
                 let mut counts: Vec<(usize, u64)> = channel_stats
