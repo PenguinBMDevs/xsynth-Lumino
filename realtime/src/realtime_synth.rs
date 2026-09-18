@@ -175,8 +175,6 @@ struct PreparedRealtimeChannels {
     /// 全局 NoteOn 入场预算池（软目标 - 当前声部数，管道每块刷新）。
     /// 全局共享：单通道文件可独享整个预算，多通道文件按需竞争。
     admission_budget: Arc<AtomicI64>,
-    /// 每通道当前被推迟（超预算）的 NoteOn 数量（诊断）。
-    admission_deferred: Vec<Arc<AtomicU64>>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -338,7 +336,6 @@ impl RealtimeSynth {
             senders,
             command_senders,
             admission_budget,
-            admission_deferred,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -364,7 +361,6 @@ impl RealtimeSynth {
             output_receiver,
             channel_stats,
             admission_budget,
-            admission_deferred,
             &stats,
             master_peak.clone(),
             hard_max_voices,
@@ -597,7 +593,6 @@ fn prepare_channels(
     let mut channel_stats = Vec::new();
     let mut senders = Vec::new();
     let mut command_senders = Vec::new();
-    let mut admission_deferred = Vec::new();
     let mut join_handles = Vec::new();
     // 全局入场预算池：初始 0（首块渲染前由管道刷新为真实值）。
     let admission_budget = Arc::new(AtomicI64::new(0));
@@ -612,9 +607,6 @@ fn prepare_channels(
         let (command_sender, command_receiver) = bounded::<ChannelCommand>(1);
         command_senders.push(command_sender);
 
-        let deferred_len = Arc::new(AtomicU64::new(0));
-        admission_deferred.push(deferred_len.clone());
-
         let output_sender = output_sender.clone();
         let join_handle = spawn_channel_thread(
             channel,
@@ -624,7 +616,6 @@ fn prepare_channels(
             command_receiver,
             output_sender,
             admission_budget.clone(),
-            deferred_len,
         )?;
         join_handles.push(join_handle);
     }
@@ -640,7 +631,6 @@ fn prepare_channels(
         senders,
         command_senders,
         admission_budget,
-        admission_deferred,
         join_handles,
         output_receiver,
     })
@@ -654,7 +644,6 @@ fn spawn_channel_thread(
     command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
     admission_budget: Arc<AtomicI64>,
-    deferred_len: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -663,29 +652,18 @@ fn spawn_channel_thread(
             let mut cur_gain = 1.0f32;
             let mut cur_pan = 0.0f32;
 
-            // 入场控制（admission control）：
-            // - **全局预算池**（软目标 - 当前总声部数，管道每块刷新）：预算内直通
-            //   NoteOn，超预算进入 `deferred`（推迟，不丢弃）。全局池保证单通道
-            //   密集文件可独享整个预算，多通道文件按需竞争，且总量有上界。
-            // - **NoteOff 按"发声计数"正确配对**：键上仍有正在发声的音时，NoteOff
-            //   必须下发（否则该音永远 release 不了 → 冻结长音）；只有"从未发声"
-            //   的 deferred NoteOn 才会被 NoteOff 配对取消。
-            //   曾经这里直接"同键有 deferred 就吞 NoteOff"，在黑乐谱同键反复触发
-            //   （撞墙后 NoteOn 被 defer）时会把在响音符的 NoteOff 吃掉，造成
-            //   整段冻结/停滞——这是根因修复。
+            // 声部上限语义（连续播放优先，抢旧不丢新）：
+            // - **全局预算池**（软目标 − 当前总声部数，管道每块刷新）：预算内
+            //   NoteOn 直接发声；预算耗尽时先**抢占一个旧声部**（T1 释放中最轻 →
+            //   T2 最轻，1ms 短淡出）再发声——新音符永远不丢、不推迟、不补发，
+            //   听感连续；超上限的代价由"最不重要的旧声部被硬切"承担。
+            //   这正是"顶到上限有硬切、但音乐不断"的语义（曾经错误的
+            //   defer/drop 实现会把音乐切成碎片并让音频落后进度条）。
+            // - **NoteOff 按"发声计数"正确配对**：键上仍有在响音符时直通。
             // - 其他事件（CC/PB/Program/Config）永远直通。
-            let mut deferred: VecDeque<(u8, u8, u32)> = VecDeque::new();
             // 每键"已下发且尚未收到 NoteOff"的音符数（FIFO 配对基准）。
             let mut sounding = [0u32; 128];
             const DRAIN_CAP: usize = 4096;
-            const DEFERRED_CAP: usize = 1024;
-            /// 推迟 TTL（admit 调用数，每块约 2 次）：超时即丢弃。
-            ///
-            /// 实时播放优先于"补全"：撞到软目标后，若把旧音符无限推迟再补发，
-            /// 音频内容会落后进度条（听感为"一小段一小段往前蠕动"）。因此超过
-            /// 约 30ms 的积压 NoteOn 直接丢弃，保证播放始终贴近实时。
-            const DEFERRED_TTL_CALLS: u32 = 6;
-            let mut admit_clock: u32 = 0;
             // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
             let try_acquire = |budget: &AtomicI64| -> bool {
                 if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
@@ -695,25 +673,7 @@ fn spawn_channel_thread(
                     false
                 }
             };
-            let admit = |channel: &mut VoiceChannel,
-                         deferred: &mut VecDeque<(u8, u8, u32)>,
-                         sounding: &mut [u32; 128],
-                         admit_clock: &mut u32| {
-                // 先补发积压 NoteOn（旧者优先）：超时者丢弃，避免播放滞后于进度。
-                while let Some(&(key, vel, inserted)) = deferred.front() {
-                    if admit_clock.wrapping_sub(inserted) > DEFERRED_TTL_CALLS {
-                        deferred.pop_front();
-                        continue;
-                    }
-                    if !try_acquire(&admission_budget) {
-                        break;
-                    }
-                    deferred.pop_front();
-                    channel
-                        .process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }));
-                    sounding[key as usize] += 1;
-                }
-                *admit_clock = admit_clock.wrapping_add(1);
+            let admit = |channel: &mut VoiceChannel, sounding: &mut [u32; 128]| {
                 let mut drained = 0;
                 while drained < DRAIN_CAP {
                     let Ok(event) = event_receiver.try_recv() else {
@@ -722,17 +682,16 @@ fn spawn_channel_thread(
                     drained += 1;
                     match event {
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
-                            if try_acquire(&admission_budget) {
-                                channel.process_event(ChannelEvent::Audio(
-                                    ChannelAudioEvent::NoteOn { key, vel },
-                                ));
-                                sounding[key as usize] += 1;
-                            } else {
-                                if deferred.len() >= DEFERRED_CAP {
-                                    deferred.pop_front();
-                                }
-                                deferred.push_back((key, vel, *admit_clock));
+                            if !try_acquire(&admission_budget) {
+                                // 预算耗尽：抢一个最不重要的旧声部再发声，
+                                // 保证"每个新音符都响"，避免断续与补发旧音。
+                                channel.steal_voices(1);
                             }
+                            channel.process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn {
+                                key,
+                                vel,
+                            }));
+                            sounding[key as usize] += 1;
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
                             let k = key as usize;
@@ -742,11 +701,6 @@ fn spawn_channel_thread(
                                     ChannelAudioEvent::NoteOff { key },
                                 ));
                                 sounding[k] -= 1;
-                            } else if let Some(pos) =
-                                deferred.iter().rposition(|(dk, _, _)| *dk == key)
-                            {
-                                // 键上没有在响音符时才取消"从未发声"的 deferred NoteOn。
-                                deferred.remove(pos);
                             } else {
                                 channel.process_event(ChannelEvent::Audio(
                                     ChannelAudioEvent::NoteOff { key },
@@ -772,16 +726,15 @@ fn spawn_channel_thread(
                         other => channel.process_event(other),
                     }
                 }
-                deferred_len.store(deferred.len() as u64, Ordering::Relaxed);
             };
 
             loop {
-                admit(&mut channel, &mut deferred, &mut sounding, &mut admit_clock);
+                admit(&mut channel, &mut sounding);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut deferred, &mut sounding, &mut admit_clock);
+                admit(&mut channel, &mut sounding);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -840,7 +793,6 @@ fn build_render_pipe(
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     admission_budget: Arc<AtomicI64>,
-    admission_deferred: Vec<Arc<AtomicU64>>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
     hard_max_voices: usize,
@@ -972,13 +924,8 @@ fn build_render_pipe(
                     .map(|(i, v)| format!("c{i}={v}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let def_max = admission_deferred
-                    .iter()
-                    .map(|d| d.load(Ordering::Relaxed))
-                    .max()
-                    .unwrap_or(0);
                 eprintln!(
-                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} top=[{}] def={}",
+                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} top=[{}]",
                     governor.level,
                     governor.load_ema(),
                     total_voices,
@@ -987,7 +934,6 @@ fn build_render_pipe(
                     action.hard_steal,
                     action.gate_active,
                     top,
-                    def_max,
                 );
             }
         }
