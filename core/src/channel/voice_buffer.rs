@@ -9,6 +9,9 @@ use std::{
 struct GroupVoice {
     pub id: usize,
     pub voice: Box<dyn Voice>,
+    /// 被 Kill（短淡出）后强制移除的块序号；`None` 表示未被 Kill。
+    /// 循环采样 release 后可能永远不报告 `ended()`，靠该期限兜底防滞留。
+    pub kill_deadline: Option<u32>,
 }
 
 impl Deref for GroupVoice {
@@ -43,6 +46,22 @@ pub struct VoiceBuffer {
     buffer: VecDeque<GroupVoice>,
     damper_held: bool,
     held_by_damper: Vec<usize>,
+    /// 渲染块序号（`remove_ended_voices` 每次调用自增），用于 Kill 死期限。
+    block_index: u32,
+}
+
+/// Kill（1ms 淡出）后最多保留的渲染块数：到期强制移除，防止循环采样滞留。
+const KILL_DEADLINE_BLOCKS: u32 = 2;
+
+/// 抢占层级：T0 已杀 → T1 释放中最轻 → T2 最轻（并列取最老）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StealTier {
+    /// 已被 Kill（已在淡出，听感代价最低）。
+    Killed,
+    /// 已进入 release 阶段的组中最轻者。
+    Releasing,
+    /// 全体最轻者（力度并列时取最老）。
+    Quietest,
 }
 
 impl VoiceBuffer {
@@ -53,6 +72,7 @@ impl VoiceBuffer {
             buffer: VecDeque::new(),
             damper_held: false,
             held_by_damper: Vec::new(),
+            block_index: 0,
         }
     }
 
@@ -107,6 +127,9 @@ impl VoiceBuffer {
         self.buffer[index]
             .deref_mut()
             .signal_release(ReleaseType::Kill);
+        // 死期限：即使采样循环导致 `ended()` 永远为 false，也会在若干块后被强制移除。
+        let deadline = self.block_index.saturating_add(KILL_DEADLINE_BLOCKS);
+        self.buffer[index].kill_deadline = Some(deadline);
     }
 
     pub fn kill_all_voices(&mut self) {
@@ -121,9 +144,9 @@ impl VoiceBuffer {
     }
 
     pub fn kill_by_exclusive_class(&mut self, class: u8) {
-        for voice in &mut self.buffer {
-            if voice.exclusive_class() == Some(class) {
-                voice.signal_release(ReleaseType::Kill);
+        for i in 0..self.buffer.len() {
+            if self.buffer[i].exclusive_class() == Some(class) {
+                self.kill_voice_fade_out(i);
             }
         }
     }
@@ -149,7 +172,11 @@ impl VoiceBuffer {
 
         let id = self.get_id();
         for voice in voices {
-            self.buffer.push_back(GroupVoice { id, voice });
+            self.buffer.push_back(GroupVoice {
+                id,
+                voice,
+                kill_deadline: None,
+            });
             len += 1;
         }
 
@@ -213,9 +240,14 @@ impl VoiceBuffer {
     }
 
     pub fn remove_ended_voices(&mut self) {
+        self.block_index = self.block_index.saturating_add(1);
+        let now = self.block_index;
         let mut i = 0;
         while i < self.buffer.len() {
-            if self.buffer[i].ended() {
+            let deadline_expired = self.buffer[i]
+                .kill_deadline
+                .is_some_and(|deadline| now >= deadline);
+            if self.buffer[i].ended() || deadline_expired {
                 self.buffer.remove(i);
             } else {
                 i += 1;
@@ -239,20 +271,53 @@ impl VoiceBuffer {
         self.buffer.len()
     }
 
-    /// 释放最老的一组声部（`VecDeque` 前端 = 最早入队）。
+    /// 当前活跃（未被 Kill）的声部组数量。
+    pub fn active_voice_count(&self) -> usize {
+        self.buffer.iter().filter(|g| !g.is_killed()).count()
+    }
+
+    /// 按分级策略抢占一组声部：短淡出（Kill）+ 死期限强制移除。
     ///
-    /// **始终硬移除**：循环采样（loop）的声部在 release 之后可能永远不报告
-    /// `ended()`，若走淡出（kill）路径会滞留在缓冲里持续渲染，导致声部数与
-    /// 渲染负载无界增长（黑乐谱实测 33 万声部 / load 24）。治理场景必须
-    /// 立即移除才能保证上界。
+    /// 优先级（听感代价从低到高）：
+    /// 1. **T0**：已被 Kill 的组（本身已在淡出/静音）；
+    /// 2. **T1**：已进入 release 的组中最轻者（note-off 后正在衰减）；
+    /// 3. **T2**：全体最轻者（力度并列时取最老——从队首迭代、严格小于保持首个）。
     ///
-    /// 返回是否有声部被移除。
-    pub fn release_oldest_voice_group(&mut self) -> bool {
+    /// 持续低音（长音、力度响）不会被"最老"直接命中：只有连轻音/衰减音
+    /// 都不存在时才会轮到它们。
+    pub fn steal_voice_group(&mut self) -> Option<StealTier> {
         if self.buffer.is_empty() {
-            return false;
+            return None;
         }
-        self.buffer.pop_front();
-        true
+
+        // T0：已 Kill
+        if let Some(index) = self.buffer.iter().position(|g| g.is_killed()) {
+            self.kill_voice_fade_out(index);
+            return Some(StealTier::Killed);
+        }
+
+        // T1/T2：一次遍历同时找"释放中最轻"与"全体最轻"（并列取最老 = 先出现者）
+        let mut releasing: Option<(usize, u8)> = None;
+        let mut quietest: Option<(usize, u8)> = None;
+        for (index, voice) in self.buffer.iter().enumerate() {
+            let velocity = voice.velocity();
+            if voice.is_releasing() && releasing.is_none_or(|(_, v)| velocity < v) {
+                releasing = Some((index, velocity));
+            }
+            if quietest.is_none_or(|(_, v)| velocity < v) {
+                quietest = Some((index, velocity));
+            }
+        }
+
+        let (index, tier) = match releasing {
+            Some((index, _)) => (index, StealTier::Releasing),
+            None => {
+                let (index, _) = quietest?;
+                (index, StealTier::Quietest)
+            }
+        };
+        self.kill_voice_fade_out(index);
+        Some(tier)
     }
 
     pub fn set_damper(&mut self, damper: bool) {

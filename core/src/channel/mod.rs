@@ -251,17 +251,17 @@ impl VoiceChannel {
         self.apply_channel_effects(out);
     }
 
-    /// 每通道声部上限：超过 `options.max_voices` 时，从"声部最多"的键里
-    /// 反复硬移除最老的一组声部（`VecDeque` 前端），直到回到上限内。
+    /// 每通道声部上限：超过 `options.max_voices` 时，从"活跃声部最多的键"里
+    /// 按分级策略抢占（T0 已 Kill → T1 释放中最轻 → T2 最轻），直到回到上限内。
     ///
-    /// - 选择最忙的键：把抢占集中在压力最大的键上；
-    /// - 选择最老的一组：保证新音符（当前正在演奏）不被丢弃；
-    /// - 按 `voice_count()`（缓冲长度）而非"未 kill"计数治理：循环采样
-    ///   release 后可能永远不报告 `ended()`，只有按缓冲长度才能保证
-    ///   声部数与渲染负载的硬上界。
+    /// - 活跃数不含已 Kill 的组：被抢的组走 1ms 淡出 + 死期限（见
+    ///   `VoiceBuffer::kill_voice_fade_out`），约 2 块后强制移除，因此
+    ///   "活跃数"会立刻下降且不会出现滞留导致的计数失真；
+    /// - 自然保护：持续长音/低音（力度响、未释放）不会因"最老"被优先命中，
+    ///   只有连衰减音与轻音都不存在时才会被抢。
     ///
-    /// 性能：计数只统计一次（O(total)），之后在 128 个计数上增量维护
-    /// （每次抢占 O(128)），避免"每杀一个都全量重扫"导致的二次复杂度卡死。
+    /// 性能：计数只统计一次（O(total)），此后在 128 个计数上增量维护；
+    /// 单次抢占 = 选键 O(128) + 在单个键内扫描 O(cap)。
     fn enforce_max_voices(&mut self) {
         let Some(cap) = self.options.max_voices else {
             return;
@@ -274,7 +274,7 @@ impl VoiceChannel {
         let mut counts: Vec<usize> = self
             .key_voices
             .iter()
-            .map(|key| key.data.voice_count())
+            .map(|key| key.data.active_voice_count())
             .collect();
         let mut total: usize = counts.iter().sum();
         if total <= cap {
@@ -291,7 +291,7 @@ impl VoiceChannel {
             else {
                 break;
             };
-            if !self.key_voices[idx].data.release_oldest_voice_group() {
+            if self.key_voices[idx].data.steal_voice_group().is_none() {
                 break;
             }
             counts[idx] -= 1;
