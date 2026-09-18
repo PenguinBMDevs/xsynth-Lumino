@@ -169,7 +169,8 @@ mod tests {
     #[test]
     fn reset_clears_skipped_notes_state() {
         let (tx, rx) = unbounded();
-        let max_nps = Arc::new(ReadWriteAtomicU64::new(0));
+        // max_nps = 1：任何 NoteOn 都超限（阈值为 0），用于构造被丢弃的音符。
+        let max_nps = Arc::new(ReadWriteAtomicU64::new(1));
         let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
 
         sender.send_event(SynthEvent::Channel(
@@ -217,5 +218,23 @@ mod tests {
         ));
 
         assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn zero_max_nps_disables_note_limiter() {
+        let (tx, rx) = unbounded();
+        // 0 = 不限流：即使 NPS 估计超限（阈值为 0），NoteOn 也必须发送。
+        let max_nps = Arc::new(ReadWriteAtomicU64::new(0));
+        let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
+
+        sender.send_event(SynthEvent::Channel(
+            0,
+            ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key: 60, vel: 1 }),
+        ));
+
+        assert!(matches!(
+            rx.recv().unwrap(),
+            ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key: 60, vel: 1 })
+        ));
     }
 }

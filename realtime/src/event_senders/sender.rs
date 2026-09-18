@@ -37,8 +37,10 @@ impl EventSender {
                     return;
                 }
 
+                let max_nps = self.max_nps.read();
                 let nps = self.nps.calculate_nps();
-                if should_send_for_vel_and_nps(*vel, nps, self.max_nps.read())
+                // max_nps == 0：关闭 NPS 限流（不丢任何 NoteOn）。
+                if (max_nps == 0 || should_send_for_vel_and_nps(*vel, nps, max_nps))
                     && !self.ignore_range.contains(vel)
                 {
                     self.sender.send(ChannelEvent::Audio(event)).ok();

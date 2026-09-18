@@ -38,6 +38,16 @@ pub struct XSynthRealtimeConfig {
     ///
     /// Default: `0..=0`
     pub ignore_range: RangeInclusive<u8>,
+
+    /// Maximum estimated notes-per-second for the realtime note limiter.
+    ///
+    /// A `NoteOn` is skipped when the estimated NPS exceeds
+    /// `max_nps * velocity / 127` (quiet notes are dropped first).
+    /// Set to `0` to disable the limiter entirely (no notes are dropped
+    /// by the NPS guard).
+    ///
+    /// Default: `10_000`
+    pub max_nps: u64,
 }
 
 impl Default for XSynthRealtimeConfig {
@@ -48,6 +58,7 @@ impl Default for XSynthRealtimeConfig {
             format: Default::default(),
             multithreading: ThreadCount::None,
             ignore_range: 0..=0,
+            max_nps: 10_000,
         }
     }
 }

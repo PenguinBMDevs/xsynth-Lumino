@@ -16,6 +16,7 @@ categories.workspace = true
 encoding_rs = "0.8.34"
 encoding_rs_io = "0.1.7"
 lazy-regex = "3.2.0"
+rayon = "1.10.0"
 regex-bnf = "0.1.2"
 simdeez = "3.0.1"
 thiserror = "1.0.63"

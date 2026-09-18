@@ -349,7 +349,7 @@ impl RealtimeSynth {
         let (stream_control, stream_owner, recovery_rx) =
             spawn_stream_thread(device.clone(), stream_config, buffered.clone())?;
 
-        let max_nps = Arc::new(ReadWriteAtomicU64::new(10000));
+        let max_nps = Arc::new(ReadWriteAtomicU64::new(config.max_nps));
 
         Ok(Self {
             data: Some(RealtimeSynthThreadSharedData {

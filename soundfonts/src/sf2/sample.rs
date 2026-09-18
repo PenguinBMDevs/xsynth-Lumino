@@ -1,5 +1,6 @@
 use super::{Sf2ParseError, Sf2SampleLinkType};
 use crate::resample::resample_vec;
+use rayon::prelude::*;
 use soundfont::raw::{SampleChunk, SampleData, SampleHeader};
 use std::{
     fs::File,
@@ -82,33 +83,33 @@ impl Sf2Sample {
             }
         }
 
-        let mut out: Vec<Sf2Sample> = Vec::new();
+        let out: Vec<Sf2Sample> = headers
+            .into_par_iter()
+            .map(|h| {
+                let start = h.start;
+                let end = h.end;
+                let sample: Vec<f32> = samples[start as usize..end as usize].into();
 
-        for h in headers {
-            let start = h.start;
-            let end = h.end;
-            let sample: Vec<f32> = samples[start as usize..end as usize].into();
-
-            let new = Sf2Sample {
-                data: if h.sample_rate != sample_rate && !sample.is_empty() {
-                    resample_vec(sample, h.sample_rate as f32, sample_rate as f32)
-                } else {
-                    sample.into()
-                },
-                link_type: h.sample_type.into(),
-                linked_sample: match h.sample_type.into() {
-                    Sf2SampleLinkType::Mono => None,
-                    _ => Some(h.sample_link),
-                },
-                original_length: end - start,
-                loop_start: h.loop_start - start,
-                loop_end: h.loop_end - start,
-                sample_rate: h.sample_rate,
-                origpitch: h.origpitch,
-                pitchadj: h.pitchadj,
-            };
-            out.push(new)
-        }
+                Sf2Sample {
+                    data: if h.sample_rate != sample_rate && !sample.is_empty() {
+                        resample_vec(sample, h.sample_rate as f32, sample_rate as f32)
+                    } else {
+                        sample.into()
+                    },
+                    link_type: h.sample_type.into(),
+                    linked_sample: match h.sample_type.into() {
+                        Sf2SampleLinkType::Mono => None,
+                        _ => Some(h.sample_link),
+                    },
+                    original_length: end - start,
+                    loop_start: h.loop_start - start,
+                    loop_end: h.loop_end - start,
+                    sample_rate: h.sample_rate,
+                    origpitch: h.origpitch,
+                    pitchadj: h.pitchadj,
+                }
+            })
+            .collect();
 
         Ok(out)
     }
