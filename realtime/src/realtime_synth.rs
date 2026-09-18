@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use xsynth_core::{
     buffered_renderer::{BufferedRenderer, BufferedRendererStatsReader},
-    channel::{ChannelConfigEvent, ChannelEvent, VoiceChannel},
+    channel::{ChannelAudioEvent, ChannelConfigEvent, ChannelEvent, VoiceChannel},
     channel_group::SynthFormat,
     effects::VolumeLimiter,
     helpers::{prepapre_cache_vec, sum_simd},
@@ -172,6 +172,8 @@ struct PreparedRealtimeChannels {
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     senders: Vec<crossbeam_channel::Sender<ChannelEvent>>,
     command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
+    /// 每通道的 NoteOn 入场预算（软目标按活跃通道均分，管道每块更新）。
+    admission_targets: Vec<Arc<AtomicU64>>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -332,6 +334,7 @@ impl RealtimeSynth {
             channel_stats,
             senders,
             command_senders,
+            admission_targets,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -356,6 +359,7 @@ impl RealtimeSynth {
             command_senders,
             output_receiver,
             channel_stats,
+            admission_targets,
             &stats,
             master_peak.clone(),
             hard_max_voices,
@@ -588,6 +592,7 @@ fn prepare_channels(
     let mut channel_stats = Vec::new();
     let mut senders = Vec::new();
     let mut command_senders = Vec::new();
+    let mut admission_targets = Vec::new();
     let mut join_handles = Vec::new();
 
     for i in 0..channel_count {
@@ -600,6 +605,10 @@ fn prepare_channels(
         let (command_sender, command_receiver) = bounded::<ChannelCommand>(1);
         command_senders.push(command_sender);
 
+        // 入场预算初始为无限制，首块渲染前由管道写入真实值。
+        let admission_target = Arc::new(AtomicU64::new(u64::MAX));
+        admission_targets.push(admission_target.clone());
+
         let output_sender = output_sender.clone();
         let join_handle = spawn_channel_thread(
             channel,
@@ -608,6 +617,7 @@ fn prepare_channels(
             event_receiver,
             command_receiver,
             output_sender,
+            admission_target,
         )?;
         join_handles.push(join_handle);
     }
@@ -622,9 +632,15 @@ fn prepare_channels(
         channel_stats,
         senders,
         command_senders,
+        admission_targets,
         join_handles,
         output_receiver,
     })
+}
+
+/// 判断事件是否为 NoteOn（仅 NoteOn 参与入场预算）。
+fn is_note_on(event: &ChannelEvent) -> bool {
+    matches!(event, ChannelEvent::Audio(ChannelAudioEvent::NoteOn { .. }))
 }
 
 fn spawn_channel_thread(
@@ -634,6 +650,7 @@ fn spawn_channel_thread(
     event_receiver: crossbeam_channel::Receiver<ChannelEvent>,
     command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
+    admission_target: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -641,13 +658,54 @@ fn spawn_channel_thread(
             // 当前增益/声像：向 UI 设定的目标平滑逼近，避免拖动产生 zipper noise。
             let mut cur_gain = 1.0f32;
             let mut cur_pan = 0.0f32;
+
+            let stats = channel.get_channel_stats();
+
+            // 入场控制（admission control）：把本通道声部数补到 `admission_target`
+            // 为止，超预算的 NoteOn 推迟到后续块（留在队列里，不丢弃）。
+            //
+            // 关键点：遇到第一个超预算的 NoteOn 就停止从队列取后续事件，严格保持
+            // 事件顺序（否则 NoteOff 可能先于对应 NoteOn 到达，导致挂音）。
+            //
+            // 这从结构上封死了"长块 → 事件积压 → 下一块全量注入 → 更长块"的雪崩。
+            let mut pending: VecDeque<ChannelEvent> = VecDeque::new();
+            const DRAIN_CAP: usize = 4096;
+            let admit = |channel: &mut VoiceChannel, pending: &mut VecDeque<ChannelEvent>| {
+                let target = admission_target.load(Ordering::Relaxed) as usize;
+                // 先按序消化上一块被推迟的事件。
+                while let Some(event) = pending.front() {
+                    if is_note_on(event) && stats.voice_count() as usize >= target {
+                        break;
+                    }
+                    if let Some(event) = pending.pop_front() {
+                        channel.process_event(event);
+                    }
+                }
+                // 只有 pending 清空后才继续从队列取新事件，保证整体顺序。
+                if !pending.is_empty() {
+                    return;
+                }
+                let mut drained = 0;
+                while drained < DRAIN_CAP {
+                    let Ok(event) = event_receiver.try_recv() else {
+                        break;
+                    };
+                    drained += 1;
+                    if is_note_on(&event) && stats.voice_count() as usize >= target {
+                        pending.push_back(event);
+                        break;
+                    }
+                    channel.process_event(event);
+                }
+            };
+
             loop {
-                channel.push_events_iter(event_receiver.try_iter());
+                admit(&mut channel, &mut pending);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                channel.push_events_iter(event_receiver.try_iter());
+                admit(&mut channel, &mut pending);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -705,6 +763,7 @@ fn build_render_pipe(
     command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
+    admission_targets: Vec<Arc<AtomicU64>>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
     hard_max_voices: usize,
@@ -727,6 +786,22 @@ fn build_render_pipe(
 
     FunctionAudioPipe::new(stream_params, move |out| {
         let block_start = Instant::now();
+
+        // 入场预算：把上一块末的软目标按"活跃通道数"均分下发给各通道。
+        // 冷启动（全通道 0 声部）时按通道总数均分，避免首块每通道都拿到全额预算。
+        // 单通道文件可独享全部预算；通道侧据此限制每块注入的 NoteOn 数，
+        // 从结构上防止事件积压后的全量注入雪崩。
+        let active_channels = channel_stats.iter().filter(|c| c.voice_count() > 0).count();
+        let divisor = if active_channels == 0 {
+            channel_count as usize
+        } else {
+            active_channels
+        }
+        .max(1);
+        let share = (governor.v_soft() / divisor as f64).max(8.0) as u64;
+        for target in &admission_targets {
+            target.store(share, Ordering::Relaxed);
+        }
 
         for sender in &command_senders {
             let mut buf = vec_cache.pop_front().unwrap();
