@@ -285,26 +285,22 @@ impl VoiceChannel {
     }
 
     /// 硬抢占 `count` 个活跃声部（L2 重度治理：跳过淡出，立即移除）。
+    ///
+    /// 批量化：按各键声部数降序，从最满的键整段弹出，避免"每弹一个都重扫全部键"。
     pub fn steal_voices_hard(&mut self, count: usize) {
         if count == 0 {
             return;
         }
+        let mut order: Vec<usize> = (0..self.key_voices.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.key_voices[i].data.voice_count()));
         let mut remaining = count;
-        while remaining > 0 {
-            let Some(idx) = self
-                .key_voices
-                .iter()
-                .enumerate()
-                .filter(|(_, key)| key.data.voice_count() > 0)
-                .max_by_key(|(_, key)| key.data.voice_count())
-                .map(|(idx, _)| idx)
-            else {
-                break;
-            };
-            if !self.key_voices[idx].data.hard_steal_oldest() {
+        for idx in order {
+            if remaining == 0 {
                 break;
             }
-            remaining -= 1;
+            while remaining > 0 && self.key_voices[idx].data.hard_steal_oldest() {
+                remaining -= 1;
+            }
         }
     }
 

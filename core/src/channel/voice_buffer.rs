@@ -4,6 +4,10 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 struct GroupVoice {
@@ -48,6 +52,11 @@ pub struct VoiceBuffer {
     held_by_damper: Vec<usize>,
     /// 渲染块序号（`remove_ended_voices` 每次调用自增），用于 Kill 死期限。
     block_index: u32,
+    /// 权威声部计数（与 `buffer.len()` 严格同步维护）。
+    ///
+    /// 由本缓冲区在所有增删点直接更新；治理器/入场控制读它做实时决策，
+    /// 不再依赖"渲染后按差值对账"的滞后统计（那种统计在长时间硬抢占下会失真）。
+    voice_counter: Arc<AtomicU64>,
 }
 
 /// Kill（1ms 淡出）后最多保留的渲染块数：到期强制移除，防止循环采样滞留。
@@ -66,7 +75,7 @@ pub enum StealTier {
 }
 
 impl VoiceBuffer {
-    pub fn new(options: ChannelInitOptions) -> Self {
+    pub fn new(voice_counter: Arc<AtomicU64>, options: ChannelInitOptions) -> Self {
         VoiceBuffer {
             options,
             id_counter: 0,
@@ -74,6 +83,18 @@ impl VoiceBuffer {
             damper_held: false,
             held_by_damper: Vec::new(),
             block_index: 0,
+            voice_counter,
+        }
+    }
+
+    /// 同步权威计数（所有增删点必须调用）。
+    fn adjust_counter(&self, delta: isize) {
+        if delta >= 0 {
+            self.voice_counter
+                .fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            self.voice_counter
+                .fetch_sub((-delta) as u64, Ordering::Relaxed);
         }
     }
 
@@ -116,6 +137,7 @@ impl VoiceBuffer {
                 }
             } else {
                 self.buffer.drain(quietest_index..(quietest_index + count));
+                self.adjust_counter(-(count as isize));
             }
 
             if let Some(index) = self.held_by_damper.iter().position(|&x| x == quietest_id) {
@@ -140,7 +162,9 @@ impl VoiceBuffer {
             }
             self.id_counter = 0;
         } else {
+            let removed = self.buffer.len();
             self.buffer.clear();
+            self.adjust_counter(-(removed as isize));
         }
     }
 
@@ -180,6 +204,7 @@ impl VoiceBuffer {
             });
             len += 1;
         }
+        self.adjust_counter(len as isize);
 
         if let Some(max_voices) = max_voices {
             if len > max_voices {
@@ -243,6 +268,7 @@ impl VoiceBuffer {
     pub fn remove_ended_voices(&mut self) {
         self.block_index = self.block_index.saturating_add(1);
         let now = self.block_index;
+        let mut removed = 0isize;
         let mut i = 0;
         while i < self.buffer.len() {
             let deadline_expired = self.buffer[i]
@@ -250,10 +276,12 @@ impl VoiceBuffer {
                 .is_some_and(|deadline| now >= deadline);
             if self.buffer[i].ended() || deadline_expired {
                 self.buffer.remove(i);
+                removed += 1;
             } else {
                 i += 1;
             }
         }
+        self.adjust_counter(-removed);
     }
 
     // pub fn iter_voices<'a>(&'a self) -> impl Iterator<Item = &Box<dyn Voice>> + 'a {
@@ -324,14 +352,21 @@ impl VoiceBuffer {
 
     /// 硬移除最老的一组声部（L2 重度治理：跳过淡出，立即释放）。
     pub fn hard_steal_oldest(&mut self) -> bool {
-        self.buffer.pop_front().is_some()
+        let popped = self.buffer.pop_front().is_some();
+        if popped {
+            self.adjust_counter(-1);
+        }
+        popped
     }
 
     /// 看门狗：每键仅保留最新 `keep` 组声部，其余立即移除（L4 自愈）。
     pub fn trim_to_newest(&mut self, keep: usize) {
+        let mut removed = 0isize;
         while self.buffer.len() > keep {
             self.buffer.pop_front();
+            removed += 1;
         }
+        self.adjust_counter(-removed);
     }
 
     pub fn set_damper(&mut self, damper: bool) {

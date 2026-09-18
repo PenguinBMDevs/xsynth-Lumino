@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicU64, Arc};
 
 use super::{
     channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::StealTier,
@@ -11,8 +8,6 @@ use super::{
 pub struct KeyData {
     key: u8,
     voices: VoiceBuffer,
-    last_voice_count: usize,
-    shared_voice_counter: Arc<AtomicU64>,
 }
 
 impl KeyData {
@@ -23,9 +18,7 @@ impl KeyData {
     ) -> KeyData {
         KeyData {
             key,
-            voices: VoiceBuffer::new(options),
-            last_voice_count: 0,
-            shared_voice_counter,
+            voices: VoiceBuffer::new(shared_voice_counter, options),
         }
     }
 
@@ -73,17 +66,6 @@ impl KeyData {
             }
             self.voices.remove_ended_voices();
         }
-
-        let voice_count = self.voices.voice_count();
-        let change = voice_count as i64 - self.last_voice_count as i64;
-        if change < 0 {
-            self.shared_voice_counter
-                .fetch_sub((-change) as u64, Ordering::SeqCst);
-        } else {
-            self.shared_voice_counter
-                .fetch_add(change as u64, Ordering::SeqCst);
-        }
-        self.last_voice_count = voice_count;
     }
 
     pub fn has_voices(&self) -> bool {

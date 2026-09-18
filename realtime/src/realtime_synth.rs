@@ -845,11 +845,9 @@ fn build_render_pipe(
         // `Steal`/`HardSteal` 命令不产生音频块，通道处理完即继续等待
         // 下一块渲染命令，因此不会破坏本块的通道同步。
         //
-        // 单块抢占配额：限制每块总抢占工作量，防止"越抢越卡、越卡越抢"的
-        // 正反馈（抢占本身要扫描键/声部，量大了会把块渲染推爆）。
-        // 超出配额的缺口由后续块渐进消化。
-        let quota = ((total_voices as f64 / 20.0).ceil() as usize).clamp(16, 256);
-        let want = action.steal.max(action.hard_steal).min(quota);
+        // 超目标即硬移除（数量已由治理器限制在总声部数的 1/4 以内），
+        // 这里只做一个防御性上限，避免异常值造成块内长任务。
+        let want = action.steal.max(action.hard_steal).min(4096);
         if want > 0 {
             let mut deficit = want as u64;
             let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
