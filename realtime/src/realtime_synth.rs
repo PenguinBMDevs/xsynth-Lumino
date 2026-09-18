@@ -178,6 +178,9 @@ struct PreparedRealtimeChannels {
     /// 紧急模式（洪峰/保命闸）：通道侧直接丢弃新 NoteOn，避免"抢一个放一个"
     /// 的连续淡出噪声（电锯音）；洪峰过后自动解除。
     emergency: Arc<AtomicBool>,
+    /// 冲洗纪元：紧急模式进入/退出时递增，通道据此整队列冲洗一次
+    /// （丢弃残留 NoteOn），消除洪峰尾料被逐块消化产生的噼啪声。
+    flush_epoch: Arc<AtomicU64>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -340,6 +343,7 @@ impl RealtimeSynth {
             command_senders,
             admission_budget,
             emergency,
+            flush_epoch,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -366,6 +370,7 @@ impl RealtimeSynth {
             channel_stats,
             admission_budget,
             emergency,
+            flush_epoch,
             &stats,
             master_peak.clone(),
             hard_max_voices,
@@ -603,6 +608,8 @@ fn prepare_channels(
     let admission_budget = Arc::new(AtomicI64::new(0));
     // 紧急模式标志：初始 false。
     let emergency = Arc::new(AtomicBool::new(false));
+    // 冲洗纪元：初始 0（管道在紧急模式进出时递增）。
+    let flush_epoch = Arc::new(AtomicU64::new(0));
 
     for i in 0..channel_count {
         let channel = VoiceChannel::new(init_options, stream_params, channel_pool.clone());
@@ -624,6 +631,7 @@ fn prepare_channels(
             output_sender,
             admission_budget.clone(),
             emergency.clone(),
+            flush_epoch.clone(),
         )?;
         join_handles.push(join_handle);
     }
@@ -640,6 +648,7 @@ fn prepare_channels(
         command_senders,
         admission_budget,
         emergency,
+        flush_epoch,
         join_handles,
         output_receiver,
     })
@@ -654,6 +663,7 @@ fn spawn_channel_thread(
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
     admission_budget: Arc<AtomicI64>,
     emergency: Arc<AtomicBool>,
+    flush_epoch: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -690,9 +700,44 @@ fn spawn_channel_thread(
             };
             // 每键"被紧急丢弃、尚未收到 NoteOff"的音符数（配对取消，防挂音）。
             let mut dropped = [0u32; 128];
+            let mut seen_epoch: u64 = flush_epoch.load(Ordering::Relaxed);
             let admit = |channel: &mut VoiceChannel,
                          sounding: &mut [u32; 128],
-                         dropped: &mut [u32; 128]| {
+                         dropped: &mut [u32; 128],
+                         seen_epoch: &mut u64| {
+                // 冲洗纪元变化（紧急模式进入/退出）：整队列丢弃残留 NoteOn，
+                // NoteOff 按配对计数取消，其余事件直通。最多 16384/次，
+                // 未清完下次继续（seen_epoch 未推进）。
+                let epoch = flush_epoch.load(Ordering::Relaxed);
+                if epoch != *seen_epoch {
+                    let mut n = 0usize;
+                    while n < 16384 {
+                        let Ok(event) = event_receiver.try_recv() else {
+                            *seen_epoch = epoch;
+                            break;
+                        };
+                        n += 1;
+                        match event {
+                            ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, .. }) => {
+                                dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                            }
+                            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
+                                let k = key as usize;
+                                if k < dropped.len() && dropped[k] > 0 {
+                                    dropped[k] -= 1;
+                                } else {
+                                    if k < sounding.len() && sounding[k] > 0 {
+                                        sounding[k] -= 1;
+                                    }
+                                    channel.process_event(ChannelEvent::Audio(
+                                        ChannelAudioEvent::NoteOff { key },
+                                    ));
+                                }
+                            }
+                            other => channel.process_event(other),
+                        }
+                    }
+                }
                 // 紧急模式（洪峰/保命闸）：新 NoteOn 直接丢弃、不再"抢一个放一个"
                 // ——后者在积压排空期间会形成连续 1ms 淡出叠加的"电锯"噪声。
                 let emergency_now = emergency.load(Ordering::Relaxed);
@@ -763,12 +808,12 @@ fn spawn_channel_thread(
             };
 
             loop {
-                admit(&mut channel, &mut sounding, &mut dropped);
+                admit(&mut channel, &mut sounding, &mut dropped, &mut seen_epoch);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut sounding, &mut dropped);
+                admit(&mut channel, &mut sounding, &mut dropped, &mut seen_epoch);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -828,6 +873,7 @@ fn build_render_pipe(
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     admission_budget: Arc<AtomicI64>,
     emergency: Arc<AtomicBool>,
+    flush_epoch: Arc<AtomicU64>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
     hard_max_voices: usize,
@@ -846,6 +892,8 @@ fn build_render_pipe(
 
     // 声部治理器：运行目标固定 = ratio × 硬上限（不随负载漂移，防自激）。
     let mut governor = Governor::new(hard_max_voices, voice_target_ratio);
+    // 紧急模式状态（用于检测进入/退出边沿并冲洗队列）。
+    let mut prev_emergency = false;
 
     FunctionAudioPipe::new(stream_params, move |out| {
         let block_start = Instant::now();
@@ -898,6 +946,12 @@ fn build_render_pipe(
             em = false;
         }
         emergency.store(em, Ordering::Relaxed);
+        // 紧急模式进入/退出边沿：递增冲洗纪元，通道整队列冲洗一次，
+        // 丢弃残留 NoteOn（洪峰尾料不再被逐块消化成噼啪声）。
+        if em != prev_emergency {
+            flush_epoch.fetch_add(1, Ordering::Relaxed);
+            prev_emergency = em;
+        }
 
         // 刷新全局入场预算池："软目标 - 当前总声部数"（由通道侧原子取用），
         // 下一块各通道据此接纳 NoteOn；单通道文件可独享整个预算。
@@ -905,10 +959,9 @@ fn build_render_pipe(
         admission_budget.store(available_voice_budget, Ordering::Relaxed);
 
         // 跨通道全局治理：从"声部最多的通道"按比例分摊抢占。
-        // `Steal`/`HardSteal` 命令不产生音频块，通道处理完即继续等待
-        // 下一块渲染命令，因此不会破坏本块的通道同步。
-        //
-        // 超目标即硬移除（数量已由治理器限制在总声部数的 1/4 以内），
+        // 全部使用**软抢占**（T1 释放中最轻 → T2 最轻，1ms 淡出）：
+        // 硬删除（pop_front 无淡出）在洪峰回收期会产生成片的"噼啪"pop，
+        // 而软抢占在听感上是平滑的短淡出。数量已由治理器限制在总声部数 1/4 内，
         // 这里只做一个防御性上限，避免异常值造成块内长任务。
         let want = action.steal.max(action.hard_steal).min(4096);
         if want > 0 {
@@ -924,12 +977,10 @@ fn build_render_pipe(
                 if take == 0 {
                     continue;
                 }
-                let command = if action.hard_steal > 0 {
-                    ChannelCommand::HardSteal(take as usize)
-                } else {
-                    ChannelCommand::Steal(take as usize)
-                };
-                if command_senders[i].send(command).is_ok() {
+                if command_senders[i]
+                    .send(ChannelCommand::Steal(take as usize))
+                    .is_ok()
+                {
                     counts[i] -= take;
                     deficit -= take;
                 }
