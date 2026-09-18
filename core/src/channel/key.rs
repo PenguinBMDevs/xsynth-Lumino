@@ -90,12 +90,12 @@ impl KeyData {
         self.voices.has_voices()
     }
 
-    /// 当前活跃（未被 kill / 未结束）的声部组数量。
-    pub fn active_voice_count(&self) -> usize {
-        self.voices.active_voice_count()
+    /// 当前声部组数量（用于每通道声部上限治理）。
+    pub fn voice_count(&self) -> usize {
+        self.voices.voice_count()
     }
 
-    /// 释放最老的一组声部（保留最新触发的音符）。返回是否有声部被释放。
+    /// 硬移除最老的一组声部（保留最新触发的音符）。返回是否有声部被移除。
     pub fn release_oldest_voice_group(&mut self) -> bool {
         self.voices.release_oldest_voice_group()
     }

@@ -239,25 +239,19 @@ impl VoiceBuffer {
         self.buffer.len()
     }
 
-    /// 当前活跃（未被 kill）的声部组数量。
-    pub fn active_voice_count(&self) -> usize {
-        self.buffer.iter().filter(|g| !g.is_killed()).count()
-    }
-
     /// 释放最老的一组声部（`VecDeque` 前端 = 最早入队）。
     ///
-    /// `fade_out_killing = true` 时走 1ms 淡出（避免爆音），
-    /// 否则立即从缓冲中移除（性能更好但可能有轻微 click）。
-    /// 返回是否有声部被释放。
+    /// **始终硬移除**：循环采样（loop）的声部在 release 之后可能永远不报告
+    /// `ended()`，若走淡出（kill）路径会滞留在缓冲里持续渲染，导致声部数与
+    /// 渲染负载无界增长（黑乐谱实测 33 万声部 / load 24）。治理场景必须
+    /// 立即移除才能保证上界。
+    ///
+    /// 返回是否有声部被移除。
     pub fn release_oldest_voice_group(&mut self) -> bool {
         if self.buffer.is_empty() {
             return false;
         }
-        if self.options.fade_out_killing {
-            self.kill_voice_fade_out(0);
-        } else {
-            self.buffer.pop_front();
-        }
+        self.buffer.pop_front();
         true
     }
 
