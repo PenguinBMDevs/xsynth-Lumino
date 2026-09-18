@@ -37,6 +37,18 @@ impl Debug for GroupVoice {
     }
 }
 
+/// 淡出期被杀 voice 的相对保留上限：`max_voices * 2 + 8`。
+///
+/// `fade_out_killing = true` 时被杀 voice 会保留在 buffer 中，直到本次渲染结束
+/// 由 `remove_ended_voices` 清除。高密度事件积压时（一个渲染块内持续到达大量
+/// NoteOn），每次 `push_voices` 都会触发全 buffer 扫描（`get_active_count` /
+/// `pop_quietest_voice_group`），若保留量无界增长，单块事件处理会退化为
+/// O(n²)（黑 MIDI 密集段实测渲染负载可达 13~28 倍实时，且长时间无法恢复）。
+/// 给保留量设上界后 buffer 长度被限制在 `active + limit`，扫描成本回到常量级。
+fn fading_retention_limit(max_voices: usize) -> usize {
+    max_voices.saturating_mul(2).saturating_add(8)
+}
+
 pub struct VoiceBuffer {
     options: ChannelInitOptions,
     id_counter: usize,
@@ -165,7 +177,33 @@ impl VoiceBuffer {
                     self.pop_quietest_voice_group(id);
                 }
             }
+
+            // 淡出保留上限：防止被杀 voice 在事件积压时无界累积，导致
+            // `get_active_count` / `pop_quietest_voice_group` 的全 buffer 扫描
+            // 在单个渲染块内退化为 O(n²)。仅截短过载时最老的淡出（听感代价最小），
+            // 正常负载下保留量低于上限，淡出质量不受影响。
+            if self.options.fade_out_killing {
+                self.trim_excess_fading_voices(max_voices);
+            }
         }
+    }
+
+    /// 将被杀（淡出中）voice 的数量裁剪到 `fading_retention_limit` 以内，
+    /// 超出部分优先丢弃最老的（最接近淡出结束，截短听感代价最小）。
+    fn trim_excess_fading_voices(&mut self, max_voices: usize) {
+        let limit = fading_retention_limit(max_voices);
+        // 快速路径：buffer 未超过「active 上限 + 淡出保留上限」时无需扫描。
+        if self.buffer.len() <= max_voices.saturating_add(limit) {
+            return;
+        }
+        let mut kept = 0usize;
+        self.buffer.retain(|group| {
+            if group.voice.is_killed() {
+                kept += 1;
+                return kept <= limit;
+            }
+            true
+        });
     }
 
     /// Releases the next voice, and all subsequent voices that have the same ID.
@@ -250,5 +288,122 @@ impl VoiceBuffer {
             self.held_by_damper.clear();
         }
         self.damper_held = damper;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fading_retention_limit, ChannelInitOptions, VoiceBuffer};
+    use crate::voice::{
+        ReleaseType, Voice, VoiceControlData, VoiceGeneratorBase, VoiceSampleGenerator,
+    };
+
+    /// 最小 Voice 实现：只关心偷声决策用到的 velocity / is_killed / ended。
+    struct MockVoice {
+        velocity: u8,
+        killed: bool,
+        ended: bool,
+    }
+
+    impl MockVoice {
+        fn new(velocity: u8) -> Self {
+            MockVoice {
+                velocity,
+                killed: false,
+                ended: false,
+            }
+        }
+    }
+
+    impl VoiceGeneratorBase for MockVoice {
+        fn ended(&self) -> bool {
+            self.ended
+        }
+
+        fn signal_release(&mut self, rel_type: ReleaseType) {
+            match rel_type {
+                ReleaseType::Kill => self.killed = true,
+                ReleaseType::Standard => self.ended = true,
+            }
+        }
+
+        fn process_controls(&mut self, _control: &VoiceControlData) {}
+    }
+
+    impl VoiceSampleGenerator for MockVoice {
+        fn render_to(&mut self, _buffer: &mut [f32]) {}
+    }
+
+    impl Voice for MockVoice {
+        fn is_releasing(&self) -> bool {
+            false
+        }
+
+        fn is_killed(&self) -> bool {
+            self.killed
+        }
+
+        fn velocity(&self) -> u8 {
+            self.velocity
+        }
+
+        fn exclusive_class(&self) -> Option<u8> {
+            None
+        }
+    }
+
+    fn push_one(buffer: &mut VoiceBuffer, velocity: u8, max_voices: usize) {
+        buffer.push_voices(
+            std::iter::once(Box::new(MockVoice::new(velocity)) as Box<dyn Voice>),
+            Some(max_voices),
+        );
+    }
+
+    #[test]
+    fn fade_killing_retains_at_most_limit_killed_voices() {
+        // 回归：高密度 NoteOn（模拟事件积压排空）下，被杀 voice 的保留量必须有界，
+        // 否则每次 push 的全 buffer 扫描会退化为 O(n²)（死亡螺旋根因）。
+        let mut buffer = VoiceBuffer::new(ChannelInitOptions {
+            fade_out_killing: true,
+        });
+        let max_voices = 2usize;
+        for i in 0..1000u32 {
+            push_one(&mut buffer, (i % 127 + 1) as u8, max_voices);
+            let limit = fading_retention_limit(max_voices);
+            assert!(
+                buffer.buffer.len() <= max_voices + limit,
+                "第 {i} 次 push 后 buffer 无界增长: {}",
+                buffer.buffer.len()
+            );
+        }
+        assert!(
+            buffer.get_active_count() <= max_voices,
+            "活跃 voice 数必须受每键上限约束"
+        );
+    }
+
+    #[test]
+    fn fade_killing_keeps_fading_voices_under_normal_load() {
+        // 正常负载（低于保留上限）下，被杀 voice 不被提前丢弃，淡出质量不受影响。
+        let mut buffer = VoiceBuffer::new(ChannelInitOptions {
+            fade_out_killing: true,
+        });
+        push_one(&mut buffer, 10, 2);
+        push_one(&mut buffer, 20, 2);
+        push_one(&mut buffer, 30, 2); // 触发一次偷声（最轻的 10 被淡出）
+        assert_eq!(buffer.buffer.len(), 3, "被杀 voice 应保留在 buffer 中淡出");
+        assert_eq!(buffer.get_active_count(), 2, "活跃 voice 应被限制为 2");
+    }
+
+    #[test]
+    fn no_fade_out_drops_stolen_voices_immediately() {
+        // fade_out_killing = false 时保持原语义：偷声立即出队，buffer 有界。
+        let mut buffer = VoiceBuffer::new(ChannelInitOptions {
+            fade_out_killing: false,
+        });
+        for _ in 0..100 {
+            push_one(&mut buffer, 50, 2);
+        }
+        assert!(buffer.buffer.len() <= 2, "无淡出时 buffer 不得超过每键上限");
     }
 }
