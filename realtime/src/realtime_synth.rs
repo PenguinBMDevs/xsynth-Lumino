@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
@@ -172,8 +172,9 @@ struct PreparedRealtimeChannels {
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     senders: Vec<crossbeam_channel::Sender<ChannelEvent>>,
     command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
-    /// 每通道的 NoteOn 入场预算（软目标按通道数均分，管道每块更新）。
-    admission_targets: Vec<Arc<AtomicU64>>,
+    /// 全局 NoteOn 入场预算池（软目标 - 当前声部数，管道每块刷新）。
+    /// 全局共享：单通道文件可独享整个预算，多通道文件按需竞争。
+    admission_budget: Arc<AtomicI64>,
     /// 每通道当前被推迟（超预算）的 NoteOn 数量（诊断）。
     admission_deferred: Vec<Arc<AtomicU64>>,
     join_handles: Vec<thread::JoinHandle<()>>,
@@ -336,7 +337,7 @@ impl RealtimeSynth {
             channel_stats,
             senders,
             command_senders,
-            admission_targets,
+            admission_budget,
             admission_deferred,
             join_handles,
             output_receiver,
@@ -362,7 +363,7 @@ impl RealtimeSynth {
             command_senders,
             output_receiver,
             channel_stats,
-            admission_targets,
+            admission_budget,
             admission_deferred,
             &stats,
             master_peak.clone(),
@@ -596,9 +597,10 @@ fn prepare_channels(
     let mut channel_stats = Vec::new();
     let mut senders = Vec::new();
     let mut command_senders = Vec::new();
-    let mut admission_targets = Vec::new();
     let mut admission_deferred = Vec::new();
     let mut join_handles = Vec::new();
+    // 全局入场预算池：初始 0（首块渲染前由管道刷新为真实值）。
+    let admission_budget = Arc::new(AtomicI64::new(0));
 
     for i in 0..channel_count {
         let channel = VoiceChannel::new(init_options, stream_params, channel_pool.clone());
@@ -610,9 +612,6 @@ fn prepare_channels(
         let (command_sender, command_receiver) = bounded::<ChannelCommand>(1);
         command_senders.push(command_sender);
 
-        // 入场预算初始为无限制，首块渲染前由管道写入真实值。
-        let admission_target = Arc::new(AtomicU64::new(u64::MAX));
-        admission_targets.push(admission_target.clone());
         let deferred_len = Arc::new(AtomicU64::new(0));
         admission_deferred.push(deferred_len.clone());
 
@@ -624,7 +623,7 @@ fn prepare_channels(
             event_receiver,
             command_receiver,
             output_sender,
-            admission_target,
+            admission_budget.clone(),
             deferred_len,
         )?;
         join_handles.push(join_handle);
@@ -640,7 +639,7 @@ fn prepare_channels(
         channel_stats,
         senders,
         command_senders,
-        admission_targets,
+        admission_budget,
         admission_deferred,
         join_handles,
         output_receiver,
@@ -654,7 +653,7 @@ fn spawn_channel_thread(
     event_receiver: crossbeam_channel::Receiver<ChannelEvent>,
     command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
-    admission_target: Arc<AtomicU64>,
+    admission_budget: Arc<AtomicI64>,
     deferred_len: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
@@ -664,10 +663,10 @@ fn spawn_channel_thread(
             let mut cur_gain = 1.0f32;
             let mut cur_pan = 0.0f32;
 
-            let stats = channel.get_channel_stats();
-
             // 入场控制（admission control）：
-            // - 预算内直通 NoteOn；超预算的 NoteOn 进入 `deferred`（推迟，不丢弃）；
+            // - **全局预算池**（软目标 - 当前总声部数，管道每块刷新）：预算内直通
+            //   NoteOn，超预算进入 `deferred`（推迟，不丢弃）。全局池保证单通道
+            //   密集文件可独享整个预算，多通道文件按需竞争，且总量有上界。
             // - **NoteOff 永远直通**：若队列里存有同键待播 NoteOn，则配对取消
             //   （该音符从未发声，不应再发 NoteOff），否则正常下发。
             //   这避免了"扣住 NoteOn 把后续 NoteOff 堵死 → 声部永不释放"的死锁。
@@ -675,11 +674,19 @@ fn spawn_channel_thread(
             let mut deferred: VecDeque<(u8, u8)> = VecDeque::new();
             const DRAIN_CAP: usize = 4096;
             const DEFERRED_CAP: usize = 4096;
+            // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
+            let try_acquire = |budget: &AtomicI64| -> bool {
+                if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    true
+                } else {
+                    budget.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            };
             let admit = |channel: &mut VoiceChannel, deferred: &mut VecDeque<(u8, u8)>| {
-                let target = admission_target.load(Ordering::Relaxed) as usize;
-                // 先补发积压 NoteOn（仅在预算内，旧者优先）。
+                // 先补发积压 NoteOn（旧者优先，仅在有全局预算时）。
                 while let Some(&(key, vel)) = deferred.front() {
-                    if stats.voice_count() as usize >= target {
+                    if !try_acquire(&admission_budget) {
                         break;
                     }
                     deferred.pop_front();
@@ -694,7 +701,7 @@ fn spawn_channel_thread(
                     drained += 1;
                     match &event {
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
-                            if (stats.voice_count() as usize) < target {
+                            if try_acquire(&admission_budget) {
                                 channel.process_event(event);
                             } else {
                                 if deferred.len() >= DEFERRED_CAP {
@@ -780,7 +787,7 @@ fn build_render_pipe(
     command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
-    admission_targets: Vec<Arc<AtomicU64>>,
+    admission_budget: Arc<AtomicI64>,
     admission_deferred: Vec<Arc<AtomicU64>>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
@@ -803,14 +810,6 @@ fn build_render_pipe(
 
     FunctionAudioPipe::new(stream_params, move |out| {
         let block_start = Instant::now();
-
-        // 入场预算：把软目标按"通道总数"均分下发给各通道（固定除数，
-        // 保证全局上界 = 软目标；按活跃通道均分会在通道间漂移、总量失控）。
-        let divisor = (channel_count as usize).max(1);
-        let share = (governor.v_soft() / divisor as f64).max(8.0) as u64;
-        for target in &admission_targets {
-            target.store(share, Ordering::Relaxed);
-        }
 
         for sender in &command_senders {
             let mut buf = vec_cache.pop_front().unwrap();
@@ -849,6 +848,11 @@ fn build_render_pipe(
 
         let action = governor.update(load, total_voices, soft_nps_gate);
         gate.set(action.gate_active, action.gate_rate);
+
+        // 刷新全局入场预算池："软目标 - 当前总声部数"（由通道侧原子取用），
+        // 下一块各通道据此接纳 NoteOn；单通道文件可独享整个预算。
+        let available_voice_budget = (governor.v_soft() - total_voices as f64).max(0.0) as i64;
+        admission_budget.store(available_voice_budget, Ordering::Relaxed);
 
         // 跨通道全局治理：从"声部最多的通道"按比例分摊抢占。
         // `Steal`/`HardSteal` 命令不产生音频块，通道处理完即继续等待
