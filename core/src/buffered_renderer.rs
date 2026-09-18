@@ -140,14 +140,15 @@ impl BufferedRenderer {
                     let delay =
                         Duration::from_secs(1) * size as u32 / stream_params.sample_rate * 90 / 100;
 
-                    // Keep at least one full render chunk (~render_window_ms) of
-                    // cushion buffered. With a smaller margin the buffer could drain
-                    // below the next audio callback's request while this thread is
-                    // still rendering, blocking the callback and causing audible
-                    // dropouts (stutter) even at low render loads.
+                    // Keep at least two full render chunks (~2 * render_window_ms)
+                    // of cushion buffered. The render thread is CPU-heavy (dense
+                    // black-MIDI blocks take tens of ms) and can be preempted; a
+                    // shallow cushion would let the audio callback run dry while a
+                    // block is still rendering, which blocks the callback and
+                    // causes audible stutter even at low average render loads.
                     loop {
                         let samples = samples.load(Ordering::SeqCst);
-                        if samples > size as i64 {
+                        if samples > size as i64 * 2 {
                             spin_sleep::sleep(delay / 10);
                         } else {
                             break;
@@ -214,10 +215,6 @@ impl BufferedRenderer {
 
         let mut i: usize = 0;
         let len = dest.len().min(self.remainder.len());
-        let samples = self
-            .stats
-            .samples
-            .fetch_sub(dest.len() as i64, Ordering::SeqCst);
 
         self.stats
             .last_request_samples
@@ -229,9 +226,16 @@ impl BufferedRenderer {
             i += 1;
         }
 
-        // Read from output queue, leave the remainder if there is any
+        // Read from output queue, leave the remainder if there is any.
+        // Never block the audio callback: if the queue is temporarily empty
+        // (render thread preempted / slow block), leave the rest as silence
+        // and let the next callback continue from the queue. Blocking here
+        // would stall the OS audio thread and cause glitches.
         while self.remainder.is_empty() {
-            let mut buf = self.receive.recv().unwrap();
+            let mut buf = match self.receive.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => break,
+            };
 
             let len = buf.len().min(dest.len() - i);
             for r in buf.drain(0..len) {
@@ -242,6 +246,11 @@ impl BufferedRenderer {
             self.remainder = buf;
         }
 
+        // Only subtract what was actually consumed: on an underrun the
+        // remaining destination is silence, not queued samples, so charging
+        // the full request would make `samples` drift permanently negative
+        // and corrupt the render thread's cushion check.
+        let samples = self.stats.samples.fetch_sub(i as i64, Ordering::SeqCst);
         self.stats
             .last_samples_after_read
             .store(samples, Ordering::Relaxed);
