@@ -18,8 +18,21 @@ pub struct XSynthRealtimeConfig {
 
     /// The length of the buffer reader in ms.
     ///
+    /// Also the event timing quantization: MIDI events are applied at render
+    /// block boundaries, so smaller blocks give tighter note timing (at the
+    /// cost of more per-block overhead).
+    ///
     /// Default: `10.0`
     pub render_window_ms: f64,
+
+    /// Target amount of rendered-but-unconsumed audio kept buffered, in ms.
+    ///
+    /// Acts as a cushion against render spikes and OS scheduling jitter.
+    /// Larger values increase output latency but drastically reduce dropouts
+    /// and the associated stutter. Should be >= `render_window_ms`.
+    ///
+    /// Default: `100.0`
+    pub cushion_ms: f64,
 
     /// Defines the format that the synthesizer will use. See the `SynthFormat`
     /// documentation for more information.
@@ -55,6 +68,7 @@ impl Default for XSynthRealtimeConfig {
         Self {
             channel_init_options: Default::default(),
             render_window_ms: 10.0,
+            cushion_ms: 100.0,
             format: Default::default(),
             multithreading: ThreadCount::None,
             ignore_range: 0..=0,

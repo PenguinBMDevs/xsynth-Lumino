@@ -338,13 +338,12 @@ impl RealtimeSynth {
             &stats,
             master_peak.clone(),
         );
+        let render_size = calculate_render_size(sample_rate, config.render_window_ms).max(1);
+        let cushion_samples =
+            calculate_render_size(sample_rate, config.cushion_ms).max(render_size);
         let buffered = Arc::new(Mutex::new(
-            BufferedRenderer::new(
-                render,
-                stream_params,
-                calculate_render_size(sample_rate, config.render_window_ms),
-            )
-            .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
+            BufferedRenderer::new(render, stream_params, render_size, cushion_samples)
+                .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
         ));
         let (stream_control, stream_owner, recovery_rx) =
             spawn_stream_thread(device.clone(), stream_config, buffered.clone())?;

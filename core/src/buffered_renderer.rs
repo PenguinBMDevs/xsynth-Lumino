@@ -108,10 +108,15 @@ impl BufferedRenderer {
     ///   read samples from
     /// - `stream_params`: Parameters of the output audio
     /// - `render_size`: The number of samples to render each iteration
+    /// - `cushion_samples`: Target number of rendered-but-unconsumed samples
+    ///   to keep buffered (clamped to at least one `render_size`). The render
+    ///   thread keeps rendering until this cushion is reached, then paces at
+    ///   ~90% of realtime.
     pub fn new<F: 'static + AudioPipe + Send>(
         mut render: F,
         stream_params: AudioStreamParams,
         render_size: usize,
+        cushion_samples: usize,
     ) -> Result<Self, io::Error> {
         let (tx, rx) = unbounded();
 
@@ -140,15 +145,17 @@ impl BufferedRenderer {
                     let delay =
                         Duration::from_secs(1) * size as u32 / stream_params.sample_rate * 90 / 100;
 
-                    // Keep at least two full render chunks (~2 * render_window_ms)
-                    // of cushion buffered. The render thread is CPU-heavy (dense
-                    // black-MIDI blocks take tens of ms) and can be preempted; a
-                    // shallow cushion would let the audio callback run dry while a
-                    // block is still rendering, which blocks the callback and
-                    // causes audible stutter even at low average render loads.
+                    // Keep the configured cushion buffered. The render thread
+                    // is CPU-heavy (dense black-MIDI blocks take tens of ms)
+                    // and can be preempted; a shallow cushion would let the
+                    // audio callback run dry while a block is still rendering,
+                    // which stutters even at low average render loads. The
+                    // cushion is decoupled from the block size so small blocks
+                    // (tight event timing) can still have a deep buffer.
                     loop {
                         let samples = samples.load(Ordering::SeqCst);
-                        if samples > size as i64 * 2 {
+                        let target = cushion_samples.max(size) as i64;
+                        if samples > target {
                             spin_sleep::sleep(delay / 10);
                         } else {
                             break;
