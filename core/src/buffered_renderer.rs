@@ -127,7 +127,6 @@ impl BufferedRenderer {
 
         let thread_handle = {
             let samples = samples.clone();
-            let last_request_samples = last_request_samples.clone();
             let render_size = render_size.clone();
             let render_time = render_time.clone();
             let killed = killed.clone();
@@ -141,11 +140,14 @@ impl BufferedRenderer {
                     let delay =
                         Duration::from_secs(1) * size as u32 / stream_params.sample_rate * 90 / 100;
 
-                    // If the render thread is ahead by over ~10%, wait until more samples are required.
+                    // Keep at least one full render chunk (~render_window_ms) of
+                    // cushion buffered. With a smaller margin the buffer could drain
+                    // below the next audio callback's request while this thread is
+                    // still rendering, blocking the callback and causing audible
+                    // dropouts (stutter) even at low render loads.
                     loop {
                         let samples = samples.load(Ordering::SeqCst);
-                        let last_requested = last_request_samples.load(Ordering::SeqCst);
-                        if samples > last_requested * 110 / 100 {
+                        if samples > size as i64 {
                             spin_sleep::sleep(delay / 10);
                         } else {
                             break;
