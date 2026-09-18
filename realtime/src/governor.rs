@@ -14,6 +14,8 @@
 const EMA_ALPHA: f64 = 0.2;
 /// L2：重度治理（供保命闸启用判断）。
 const L2: f64 = 1.0;
+/// 单块瞬时负载超过此值即视为洪峰（立即开闸，不等 EMA）。
+const INSTANT_SPIKE: f64 = 2.0;
 /// L3：持续过载判定。
 const L3: f64 = 1.5;
 /// L4：看门狗触发所需的持续过载块数（≈1s @10ms 块）。
@@ -153,7 +155,9 @@ impl Governor {
             steal: 0,
             hard_steal,
             watchdog_keep: (self.level >= 4).then_some(WATCHDOG_KEEP_PER_KEY),
-            gate_active: gate_enabled && self.load_ema > L2,
+            // 保命闸：持续过载（EMA）或**单块瞬时尖峰**（如 1M NPS 洪峰）立即启用，
+            // 不等 EMA 爬升，缩短"洪峰注入窗口"。
+            gate_active: gate_enabled && (self.load_ema > L2 || load > INSTANT_SPIKE),
             gate_rate: (self.v_soft.max(MIN_SOFT) * 2.0) as u64,
         }
     }
@@ -238,6 +242,14 @@ mod tests {
         }
         assert!(saw_watchdog, "持续过载应触发看门狗");
         assert_eq!(g.level, 0);
+    }
+
+    #[test]
+    fn instant_spike_activates_gate_immediately() {
+        let mut g = Governor::new(10_000, 0.632);
+        // 单块 load=5.0（EMA 还没爬升）：开闸条件下必须立即启用。
+        let a = g.update(5.0, 500, true);
+        assert!(a.gate_active, "瞬时尖峰应立即开闸");
     }
 
     #[test]

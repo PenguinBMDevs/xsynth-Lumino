@@ -127,6 +127,7 @@ fn run_stream(args: &[String]) {
     let cap: Option<usize> = std::env::var("CAP").ok().and_then(|s| s.parse().ok());
     cfg.global_max_voices = Some(cap.unwrap_or(200_000));
     cfg.voice_target_ratio = 1.0;
+    cfg.soft_nps_gate = std::env::var_os("GATE").is_some();
     cfg.max_nps = 0;
 
     let mut synth = RealtimeSynth::open_with_default_output(cfg).expect("open realtime synth");

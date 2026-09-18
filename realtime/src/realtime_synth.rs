@@ -663,7 +663,10 @@ fn spawn_channel_thread(
             // - 其他事件（CC/PB/Program/Config）永远直通。
             // 每键"已下发且尚未收到 NoteOff"的音符数（FIFO 配对基准）。
             let mut sounding = [0u32; 128];
-            const DRAIN_CAP: usize = 4096;
+            // 单次 admit 调用最多从队列取的事件数（每块调用约 2 次）：
+            // 正常播放每通道每块仅需个位数~几十个事件（含单通道超密文件 ~200），
+            // 256 足够；洪峰（1M NPS）时把注入量封顶，避免 V 在一个块内冲到数万。
+            const DRAIN_CAP: usize = 256;
             // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
             let try_acquire = |budget: &AtomicI64| -> bool {
                 if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
