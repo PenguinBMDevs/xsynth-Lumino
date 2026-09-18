@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
@@ -175,6 +175,9 @@ struct PreparedRealtimeChannels {
     /// 全局 NoteOn 入场预算池（软目标 - 当前声部数，管道每块刷新）。
     /// 全局共享：单通道文件可独享整个预算，多通道文件按需竞争。
     admission_budget: Arc<AtomicI64>,
+    /// 紧急模式（洪峰/保命闸）：通道侧直接丢弃新 NoteOn，避免"抢一个放一个"
+    /// 的连续淡出噪声（电锯音）；洪峰过后自动解除。
+    emergency: Arc<AtomicBool>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -336,6 +339,7 @@ impl RealtimeSynth {
             senders,
             command_senders,
             admission_budget,
+            emergency,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -361,6 +365,7 @@ impl RealtimeSynth {
             output_receiver,
             channel_stats,
             admission_budget,
+            emergency,
             &stats,
             master_peak.clone(),
             hard_max_voices,
@@ -596,6 +601,8 @@ fn prepare_channels(
     let mut join_handles = Vec::new();
     // 全局入场预算池：初始 0（首块渲染前由管道刷新为真实值）。
     let admission_budget = Arc::new(AtomicI64::new(0));
+    // 紧急模式标志：初始 false。
+    let emergency = Arc::new(AtomicBool::new(false));
 
     for i in 0..channel_count {
         let channel = VoiceChannel::new(init_options, stream_params, channel_pool.clone());
@@ -616,6 +623,7 @@ fn prepare_channels(
             command_receiver,
             output_sender,
             admission_budget.clone(),
+            emergency.clone(),
         )?;
         join_handles.push(join_handle);
     }
@@ -631,6 +639,7 @@ fn prepare_channels(
         senders,
         command_senders,
         admission_budget,
+        emergency,
         join_handles,
         output_receiver,
     })
@@ -644,6 +653,7 @@ fn spawn_channel_thread(
     command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
     admission_budget: Arc<AtomicI64>,
+    emergency: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -667,6 +677,8 @@ fn spawn_channel_thread(
             // 正常播放每通道每块仅需个位数~几十个事件（含单通道超密文件 ~200），
             // 256 足够；洪峰（1M NPS）时把注入量封顶，避免 V 在一个块内冲到数万。
             const DRAIN_CAP: usize = 256;
+            // 紧急模式下加速排空队列（丢弃便宜，快速清掉洪峰积压）。
+            const DRAIN_CAP_EMERGENCY: usize = 4096;
             // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
             let try_acquire = |budget: &AtomicI64| -> bool {
                 if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
@@ -676,35 +688,51 @@ fn spawn_channel_thread(
                     false
                 }
             };
-            let admit = |channel: &mut VoiceChannel, sounding: &mut [u32; 128]| {
+            // 每键"被紧急丢弃、尚未收到 NoteOff"的音符数（配对取消，防挂音）。
+            let mut dropped = [0u32; 128];
+            let admit = |channel: &mut VoiceChannel,
+                         sounding: &mut [u32; 128],
+                         dropped: &mut [u32; 128]| {
+                // 紧急模式（洪峰/保命闸）：新 NoteOn 直接丢弃、不再"抢一个放一个"
+                // ——后者在积压排空期间会形成连续 1ms 淡出叠加的"电锯"噪声。
+                let emergency_now = emergency.load(Ordering::Relaxed);
+                let drain_cap = if emergency_now {
+                    DRAIN_CAP_EMERGENCY
+                } else {
+                    DRAIN_CAP
+                };
                 let mut drained = 0;
-                while drained < DRAIN_CAP {
+                while drained < drain_cap {
                     let Ok(event) = event_receiver.try_recv() else {
                         break;
                     };
                     drained += 1;
                     match event {
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
-                            if !try_acquire(&admission_budget) {
-                                // 预算耗尽：抢一个最不重要的旧声部再发声，
-                                // 保证"每个新音符都响"，避免断续与补发旧音。
-                                channel.steal_voices(1);
+                            if emergency_now {
+                                dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                            } else {
+                                if !try_acquire(&admission_budget) {
+                                    // 预算耗尽：抢一个最不重要的旧声部再发声，
+                                    // 保证"每个新音符都响"，避免断续与补发旧音。
+                                    channel.steal_voices(1);
+                                }
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOn { key, vel },
+                                ));
+                                sounding[key as usize] += 1;
                             }
-                            channel.process_event(ChannelEvent::Audio(ChannelAudioEvent::NoteOn {
-                                key,
-                                vel,
-                            }));
-                            sounding[key as usize] += 1;
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
                             let k = key as usize;
-                            if k < sounding.len() && sounding[k] > 0 {
-                                // 该键仍有在响音符：NoteOff 必须下发，释放对应声部。
-                                channel.process_event(ChannelEvent::Audio(
-                                    ChannelAudioEvent::NoteOff { key },
-                                ));
-                                sounding[k] -= 1;
+                            if k < dropped.len() && dropped[k] > 0 {
+                                // 该音符在紧急模式下被丢弃：NoteOff 配对取消，不下发。
+                                dropped[k] -= 1;
                             } else {
+                                if k < sounding.len() && sounding[k] > 0 {
+                                    // 该键仍有在响音符：NoteOff 必须下发，释放对应声部。
+                                    sounding[k] -= 1;
+                                }
                                 channel.process_event(ChannelEvent::Audio(
                                     ChannelAudioEvent::NoteOff { key },
                                 ));
@@ -712,17 +740,20 @@ fn spawn_channel_thread(
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff) => {
                             sounding.fill(0);
+                            dropped.fill(0);
                             channel
                                 .process_event(ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff));
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled) => {
                             sounding.fill(0);
+                            dropped.fill(0);
                             channel.process_event(ChannelEvent::Audio(
                                 ChannelAudioEvent::AllNotesKilled,
                             ));
                         }
                         ChannelEvent::Audio(ChannelAudioEvent::SystemReset) => {
                             sounding.fill(0);
+                            dropped.fill(0);
                             channel
                                 .process_event(ChannelEvent::Audio(ChannelAudioEvent::SystemReset));
                         }
@@ -732,12 +763,12 @@ fn spawn_channel_thread(
             };
 
             loop {
-                admit(&mut channel, &mut sounding);
+                admit(&mut channel, &mut sounding, &mut dropped);
                 let command = match command_receiver.recv() {
                     Ok(command) => command,
                     Err(_) => break,
                 };
-                admit(&mut channel, &mut sounding);
+                admit(&mut channel, &mut sounding, &mut dropped);
 
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
@@ -796,6 +827,7 @@ fn build_render_pipe(
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     admission_budget: Arc<AtomicI64>,
+    emergency: Arc<AtomicBool>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
     hard_max_voices: usize,
@@ -855,6 +887,17 @@ fn build_render_pipe(
 
         let action = governor.update(load, total_voices, soft_nps_gate);
         gate.set(action.gate_active, action.gate_rate);
+
+        // 紧急模式状态机（迟滞）：洪峰（瞬时 load>2）、保命闸启用或持续重载时进入，
+        // 通道侧转为"直接丢弃新 NoteOn"（不抢不补），避免积压排空期"抢一个放一个"
+        // 的连续 1ms 淡出叠加噪声（电锯音）；负载回落后退出。
+        let mut em = emergency.load(Ordering::Relaxed);
+        if !em && (load > 2.0 || governor.load_ema() > 1.2 || action.gate_active) {
+            em = true;
+        } else if em && governor.load_ema() < 0.8 && load < 1.0 {
+            em = false;
+        }
+        emergency.store(em, Ordering::Relaxed);
 
         // 刷新全局入场预算池："软目标 - 当前总声部数"（由通道侧原子取用），
         // 下一块各通道据此接纳 NoteOn；单通道文件可独享整个预算。
@@ -928,7 +971,7 @@ fn build_render_pipe(
                     .collect::<Vec<_>>()
                     .join(" ");
                 eprintln!(
-                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} top=[{}]",
+                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} em={} top=[{}]",
                     governor.level,
                     governor.load_ema(),
                     total_voices,
@@ -936,6 +979,7 @@ fn build_render_pipe(
                     action.steal,
                     action.hard_steal,
                     action.gate_active,
+                    em,
                     top,
                 );
             }
