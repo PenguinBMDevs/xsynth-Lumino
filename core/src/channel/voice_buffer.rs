@@ -53,11 +53,12 @@ pub struct VoiceBuffer {
 /// Kill（1ms 淡出）后最多保留的渲染块数：到期强制移除，防止循环采样滞留。
 const KILL_DEADLINE_BLOCKS: u32 = 2;
 
-/// 抢占层级：T0 已杀 → T1 释放中最轻 → T2 最轻（并列取最老）。
+/// 抢占层级：T1 释放中最轻 → T2 最轻（并列取最老）。
+///
+/// 只从"未 Kill"的活跃组中选择：已 Kill 的组由死期限负责移除，再次"抢占"
+/// 它们既不会降低活跃数（会把治理计数带偏），也没有听感收益。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StealTier {
-    /// 已被 Kill（已在淡出，听感代价最低）。
-    Killed,
     /// 已进入 release 阶段的组中最轻者。
     Releasing,
     /// 全体最轻者（力度并列时取最老）。
@@ -276,30 +277,29 @@ impl VoiceBuffer {
         self.buffer.iter().filter(|g| !g.is_killed()).count()
     }
 
-    /// 按分级策略抢占一组声部：短淡出（Kill）+ 死期限强制移除。
+    /// 按分级策略抢占一组**活跃**（未 Kill）声部：短淡出（Kill）+ 死期限强制移除。
     ///
     /// 优先级（听感代价从低到高）：
-    /// 1. **T0**：已被 Kill 的组（本身已在淡出/静音）；
-    /// 2. **T1**：已进入 release 的组中最轻者（note-off 后正在衰减）；
-    /// 3. **T2**：全体最轻者（力度并列时取最老——从队首迭代、严格小于保持首个）。
+    /// 1. **T1**：已进入 release 的组中最轻者（note-off 后正在衰减）；
+    /// 2. **T2**：全体最轻者（力度并列时取最老——从队首迭代、严格小于保持首个）。
     ///
-    /// 持续低音（长音、力度响）不会被"最老"直接命中：只有连轻音/衰减音
-    /// 都不存在时才会轮到它们。
+    /// 已 Kill 的组会被跳过：它们已计入"非活跃"，再次 kill 不会降低活跃数，
+    /// 反而会让治理计数虚降（此前实测导致活跃声部无界增长）；它们的移除由
+    /// 死期限在 `remove_ended_voices` 中完成。
+    ///
+    /// 自然保护：持续低音（长音、力度响、未释放）不会被优先命中。
     pub fn steal_voice_group(&mut self) -> Option<StealTier> {
         if self.buffer.is_empty() {
             return None;
-        }
-
-        // T0：已 Kill
-        if let Some(index) = self.buffer.iter().position(|g| g.is_killed()) {
-            self.kill_voice_fade_out(index);
-            return Some(StealTier::Killed);
         }
 
         // T1/T2：一次遍历同时找"释放中最轻"与"全体最轻"（并列取最老 = 先出现者）
         let mut releasing: Option<(usize, u8)> = None;
         let mut quietest: Option<(usize, u8)> = None;
         for (index, voice) in self.buffer.iter().enumerate() {
+            if voice.is_killed() {
+                continue;
+            }
             let velocity = voice.velocity();
             if voice.is_releasing() && releasing.is_none_or(|(_, v)| velocity < v) {
                 releasing = Some((index, velocity));
