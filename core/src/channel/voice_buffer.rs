@@ -294,10 +294,12 @@ impl VoiceBuffer {
         }
 
         // T1/T2：一次遍历同时找"释放中最轻"与"全体最轻"（并列取最老 = 先出现者）
+        // 保护刚触发的音符：跳过最新一组（队尾，id 最大）。
+        let newest_id = self.buffer.back().map(|g| g.id);
         let mut releasing: Option<(usize, u8)> = None;
         let mut quietest: Option<(usize, u8)> = None;
         for (index, voice) in self.buffer.iter().enumerate() {
-            if voice.is_killed() {
+            if voice.is_killed() || Some(voice.id) == newest_id {
                 continue;
             }
             let velocity = voice.velocity();
@@ -318,6 +320,18 @@ impl VoiceBuffer {
         };
         self.kill_voice_fade_out(index);
         Some(tier)
+    }
+
+    /// 硬移除最老的一组声部（L2 重度治理：跳过淡出，立即释放）。
+    pub fn hard_steal_oldest(&mut self) -> bool {
+        self.buffer.pop_front().is_some()
+    }
+
+    /// 看门狗：每键仅保留最新 `keep` 组声部，其余立即移除（L4 自愈）。
+    pub fn trim_to_newest(&mut self, keep: usize) {
+        while self.buffer.len() > keep {
+            self.buffer.pop_front();
+        }
     }
 
     pub fn set_damper(&mut self, damper: bool) {

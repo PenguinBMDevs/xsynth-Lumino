@@ -105,6 +105,16 @@ impl KeyData {
         self.voices.steal_voice_group()
     }
 
+    /// 硬移除最老的一组声部（L2 重度治理）。
+    pub fn hard_steal_oldest(&mut self) -> bool {
+        self.voices.hard_steal_oldest()
+    }
+
+    /// 看门狗：仅保留最新 `keep` 组声部。
+    pub fn trim_to_newest(&mut self, keep: usize) {
+        self.voices.trim_to_newest(keep);
+    }
+
     pub fn set_damper(&mut self, damper: bool) {
         self.voices.set_damper(damper);
     }

@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self},
+    time::Instant,
 };
 
 use cpal::{
@@ -26,7 +27,8 @@ use xsynth_core::{
 };
 
 use crate::{
-    util::ReadWriteAtomicU64, RealtimeEventSender, SynthEvent, ThreadCount, XSynthRealtimeConfig,
+    util::ReadWriteAtomicU64, EmergencyGate, Governor, RealtimeEventSender, SynthEvent,
+    ThreadCount, XSynthRealtimeConfig, DEFAULT_HARD_MAX_VOICES,
 };
 
 #[derive(Debug, Error)]
@@ -156,11 +158,14 @@ struct RealtimeSynthThreadSharedData {
 /// 通道线程命令。
 ///
 /// - `Render`：渲染一块并送回管线（现行为）；
-/// - `Steal`：只执行声部抢占（跨通道全局上限由渲染管线统一调度），
-///   不回送音频块。
+/// - `Steal`：软抢占（分级选择 + 短淡出 + 死期限）；
+/// - `HardSteal`：硬抢占（L2 重度治理：跳过淡出立即移除）；
+/// - `WatchdogReset`：L4 看门狗自愈（每键仅保留最新 N 组）。
 enum ChannelCommand {
     Render(Vec<f32>),
     Steal(usize),
+    HardSteal(usize),
+    WatchdogReset(usize),
 }
 
 struct PreparedRealtimeChannels {
@@ -339,6 +344,12 @@ impl RealtimeSynth {
         )?;
 
         let stats = RealtimeSynthStats::new();
+        // 硬上限（量程）：`None`/`0` 为自动模式，使用默认 10000。
+        let hard_max_voices = match config.global_max_voices {
+            Some(n) if n > 0 => n,
+            _ => DEFAULT_HARD_MAX_VOICES,
+        };
+        let gate = EmergencyGate::new();
         let render = build_render_pipe(
             stream_params,
             channel_count,
@@ -347,7 +358,10 @@ impl RealtimeSynth {
             channel_stats,
             &stats,
             master_peak.clone(),
-            config.global_max_voices,
+            hard_max_voices,
+            config.voice_target_ratio,
+            config.soft_nps_gate,
+            gate.clone(),
         );
         let render_size = calculate_render_size(sample_rate, config.render_window_ms).max(1);
         let cushion_samples =
@@ -365,8 +379,13 @@ impl RealtimeSynth {
             data: Some(RealtimeSynthThreadSharedData {
                 buffered_renderer: buffered,
 
-                event_senders: RealtimeEventSender::new(senders, max_nps, config.ignore_range)
-                    .map_err(RealtimeSynthError::EventSenderInit)?,
+                event_senders: RealtimeEventSender::new(
+                    senders,
+                    max_nps,
+                    config.ignore_range,
+                    gate,
+                )
+                .map_err(RealtimeSynthError::EventSenderInit)?,
                 stream_control,
             }),
             stream_owner: Some(stream_owner),
@@ -636,6 +655,16 @@ fn spawn_channel_thread(
                         channel.steal_voices(count);
                         continue;
                     }
+                    // L2 重度治理：硬移除（跳过淡出）。
+                    ChannelCommand::HardSteal(count) => {
+                        channel.steal_voices_hard(count);
+                        continue;
+                    }
+                    // L4 看门狗：每键仅保留最新 N 组，立即释放其余。
+                    ChannelCommand::WatchdogReset(keep) => {
+                        channel.trim_to_newest(keep);
+                        continue;
+                    }
                     ChannelCommand::Render(vec) => vec,
                 };
 
@@ -669,6 +698,7 @@ fn spawn_channel_thread(
         .map_err(RealtimeSynthError::ChannelThreadSpawn)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_render_pipe(
     stream_params: AudioStreamParams,
     channel_count: u32,
@@ -677,7 +707,10 @@ fn build_render_pipe(
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
-    global_max_voices: Option<usize>,
+    hard_max_voices: usize,
+    voice_target_ratio: f64,
+    soft_nps_gate: bool,
+    gate: Arc<EmergencyGate>,
 ) -> FunctionAudioPipe<impl FnMut(&mut [f32]) + Send> {
     let mut vec_cache: VecDeque<Vec<f32>> = VecDeque::new();
     for _ in 0..channel_count {
@@ -685,8 +718,16 @@ fn build_render_pipe(
     }
 
     let total_voice_count = stats.voice_count.clone();
+    let sample_rate = stream_params.sample_rate as f64;
+    let output_channels = (stream_params.channels.count() as f64).max(1.0);
+
+    // 负载闭环治理器：运行目标 = min(ratio × 硬上限, 负载反解容量)，
+    // 硬上限只做量程，负载反馈只会让软目标更低、不会更高。
+    let mut governor = Governor::new(hard_max_voices, voice_target_ratio);
 
     FunctionAudioPipe::new(stream_params, move |out| {
+        let block_start = Instant::now();
+
         for sender in &command_senders {
             let mut buf = vec_cache.pop_front().unwrap();
             prepapre_cache_vec(&mut buf, out.len(), 0.0);
@@ -714,31 +755,75 @@ fn build_render_pipe(
         let total_voices: u64 = channel_stats.iter().map(|c| c.voice_count()).sum();
         total_voice_count.store(total_voices, Ordering::SeqCst);
 
-        // 跨通道全局声部上限：超出时向"声部最多的通道"下发抢占命令。
-        // `Steal` 命令不产生音频块，通道处理完即继续等待下一块渲染命令，
-        // 因此不会破坏本块的通道同步。
-        if let Some(cap) = global_max_voices {
-            if cap > 0 && total_voices > cap as u64 {
-                let mut deficit = total_voices - cap as u64;
-                let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
-                let mut order: Vec<usize> = (0..channel_count as usize).collect();
-                order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
-                for i in order {
-                    if deficit == 0 {
-                        break;
-                    }
-                    let take = counts[i].min(deficit);
-                    if take == 0 {
-                        continue;
-                    }
-                    if command_senders[i]
-                        .send(ChannelCommand::Steal(take as usize))
-                        .is_ok()
-                    {
-                        counts[i] -= take;
-                        deficit -= take;
-                    }
+        // 负载 = 本块渲染耗时 / 块时长（与采样率无关的可比量）。
+        let block_secs = out.len() as f64 / (sample_rate * output_channels);
+        let load = if block_secs > 0.0 {
+            block_start.elapsed().as_secs_f64() / block_secs
+        } else {
+            0.0
+        };
+
+        let action = governor.update(load, total_voices, soft_nps_gate);
+        gate.set(action.gate_active, action.gate_rate);
+
+        // 跨通道全局治理：从"声部最多的通道"按比例分摊抢占。
+        // `Steal`/`HardSteal` 命令不产生音频块，通道处理完即继续等待
+        // 下一块渲染命令，因此不会破坏本块的通道同步。
+        let want = action.steal.max(action.hard_steal);
+        if want > 0 {
+            let mut deficit = want as u64;
+            let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
+            let mut order: Vec<usize> = (0..channel_count as usize).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
+            for i in order {
+                if deficit == 0 {
+                    break;
                 }
+                let take = counts[i].min(deficit);
+                if take == 0 {
+                    continue;
+                }
+                let command = if action.hard_steal > 0 {
+                    ChannelCommand::HardSteal(take as usize)
+                } else {
+                    ChannelCommand::Steal(take as usize)
+                };
+                if command_senders[i].send(command).is_ok() {
+                    counts[i] -= take;
+                    deficit -= take;
+                }
+            }
+        }
+
+        // L4 看门狗：每键仅保留最新 K 组 + 重置治理基线，避免带着过载
+        // 历史继续决策（自愈，防"顶破缓冲后永久损坏"）。
+        if let Some(keep) = action.watchdog_keep {
+            for sender in &command_senders {
+                sender.send(ChannelCommand::WatchdogReset(keep)).ok();
+            }
+            gate.set(false, action.gate_rate);
+            governor.reset_after_watchdog();
+        }
+
+        // 治理诊断：仅异常时低频输出（受 XSYNTH_GOV_DEBUG 控制）。
+        if governor.level > 0 && std::env::var_os("XSYNTH_GOV_DEBUG").is_some() {
+            static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 1 {
+                LAST_LOG.store(now, Ordering::Relaxed);
+                eprintln!(
+                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={}",
+                    governor.level,
+                    governor.load_ema(),
+                    total_voices,
+                    governor.v_soft(),
+                    action.steal,
+                    action.hard_steal,
+                    action.gate_active,
+                );
             }
         }
     })
@@ -1009,12 +1094,13 @@ mod tests {
 
     #[test]
     fn apply_channel_mix_gain_and_pan() {
-        // 立体声交织 [L,R,L,R]；增益 1、声像居中 → 不变
+        // 立体声交织 [L,R,L,R]；等功率声像：居中为 sqrt(0.5)（-3dB）
         let mut buf = vec![1.0, 1.0, 1.0, 1.0];
         apply_channel_mix(&mut buf, 1.0, 0.0);
+        let center = 0.5f32.sqrt();
         assert!(
-            (buf[0] - 1.0).abs() < 1e-5 && (buf[1] - 1.0).abs() < 1e-5,
-            "居中增益1应不变: {buf:?}"
+            (buf[0] - center).abs() < 1e-5 && (buf[1] - center).abs() < 1e-5,
+            "center pan must be equal-power: {buf:?}"
         );
 
         // 全左 → 右声道归零，左声道保持

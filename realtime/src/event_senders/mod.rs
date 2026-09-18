@@ -6,9 +6,11 @@ use xsynth_core::channel::{ChannelAudioEvent, ChannelEvent, ControlEvent};
 
 use crate::{util::ReadWriteAtomicU64, SynthEvent};
 
+mod gate;
 mod nps;
 mod sender;
 
+pub use gate::EmergencyGate;
 use sender::EventSender;
 
 /// A helper object to send events to the realtime synthesizer.
@@ -22,11 +24,14 @@ impl RealtimeEventSender {
         senders: Vec<Sender<ChannelEvent>>,
         max_nps: Arc<ReadWriteAtomicU64>,
         ignore_range: RangeInclusive<u8>,
+        gate: Arc<EmergencyGate>,
     ) -> Result<RealtimeEventSender, io::Error> {
         Ok(RealtimeEventSender {
             senders: senders
                 .into_iter()
-                .map(|sender| EventSender::new(max_nps.clone(), sender, ignore_range.clone()))
+                .map(|sender| {
+                    EventSender::new(max_nps.clone(), sender, ignore_range.clone(), gate.clone())
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -141,14 +146,15 @@ mod tests {
     use crossbeam_channel::unbounded;
     use xsynth_core::channel::{ChannelAudioEvent, ChannelEvent};
 
-    use super::RealtimeEventSender;
+    use super::{EmergencyGate, RealtimeEventSender};
     use crate::{util::ReadWriteAtomicU64, SynthEvent};
 
     #[test]
     fn cloned_sender_can_be_sent_to_another_thread() {
         let (tx, rx) = unbounded();
         let max_nps = Arc::new(ReadWriteAtomicU64::new(10_000));
-        let sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
+        let sender =
+            RealtimeEventSender::new(vec![tx], max_nps, 0..=0, EmergencyGate::new()).unwrap();
 
         let mut sender_thread = sender.clone();
         thread::spawn(move || {
@@ -169,19 +175,26 @@ mod tests {
     #[test]
     fn reset_clears_skipped_notes_state() {
         let (tx, rx) = unbounded();
-        // max_nps = 1：任何 NoteOn 都超限（阈值为 0），用于构造被丢弃的音符。
-        let max_nps = Arc::new(ReadWriteAtomicU64::new(1));
-        let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
+        let max_nps = Arc::new(ReadWriteAtomicU64::new(0));
+        let gate = EmergencyGate::new();
+        gate.set(true, 1); // 保命闸低限速：突发耗尽后丢音
+        let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0, gate).unwrap();
 
+        // 突发 1 个通过，其余被闸门丢弃
+        for key in 60..66 {
+            sender.send_event(SynthEvent::Channel(
+                0,
+                ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel: 100 }),
+            ));
+        }
+        assert!(!rx.is_empty(), "至少有 1 个音符通过突发");
+        while rx.try_recv().is_ok() {}
+
+        // 被丢弃音符的 NoteOff 被 skipped 计数抵消，不发送（避免挂音）
         sender.send_event(SynthEvent::Channel(
             0,
-            ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key: 60, vel: 100 }),
+            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 61 }),
         ));
-        sender.send_event(SynthEvent::Channel(
-            0,
-            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 60 }),
-        ));
-
         assert!(rx.is_empty());
 
         sender.reset_synth();
@@ -195,14 +208,14 @@ mod tests {
             ChannelEvent::Audio(ChannelAudioEvent::ResetControl)
         ));
 
+        // 重置后 skipped 已清空：同样的 NoteOff 应正常发送
         sender.send_event(SynthEvent::Channel(
             0,
-            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 60 }),
+            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 61 }),
         ));
-
         assert!(matches!(
             rx.recv().unwrap(),
-            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 60 })
+            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key: 61 })
         ));
     }
 
@@ -210,7 +223,8 @@ mod tests {
     fn out_of_range_channel_is_ignored() {
         let (tx, rx) = unbounded();
         let max_nps = Arc::new(ReadWriteAtomicU64::new(10_000));
-        let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
+        let mut sender =
+            RealtimeEventSender::new(vec![tx], max_nps, 0..=0, EmergencyGate::new()).unwrap();
 
         sender.send_event(SynthEvent::Channel(
             1,
@@ -225,7 +239,8 @@ mod tests {
         let (tx, rx) = unbounded();
         // 0 = 不限流：即使 NPS 估计超限（阈值为 0），NoteOn 也必须发送。
         let max_nps = Arc::new(ReadWriteAtomicU64::new(0));
-        let mut sender = RealtimeEventSender::new(vec![tx], max_nps, 0..=0).unwrap();
+        let mut sender =
+            RealtimeEventSender::new(vec![tx], max_nps, 0..=0, EmergencyGate::new()).unwrap();
 
         sender.send_event(SynthEvent::Channel(
             0,

@@ -284,6 +284,37 @@ impl VoiceChannel {
         }
     }
 
+    /// 硬抢占 `count` 个活跃声部（L2 重度治理：跳过淡出，立即移除）。
+    pub fn steal_voices_hard(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut remaining = count;
+        while remaining > 0 {
+            let Some(idx) = self
+                .key_voices
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| key.data.voice_count() > 0)
+                .max_by_key(|(_, key)| key.data.voice_count())
+                .map(|(idx, _)| idx)
+            else {
+                break;
+            };
+            if !self.key_voices[idx].data.hard_steal_oldest() {
+                break;
+            }
+            remaining -= 1;
+        }
+    }
+
+    /// 看门狗自愈：每键仅保留最新 `keep` 组声部，其余立即移除。
+    pub fn trim_to_newest(&mut self, keep: usize) {
+        for key in self.key_voices.iter_mut() {
+            key.data.trim_to_newest(keep);
+        }
+    }
+
     /// 每通道声部上限：超过 `options.max_voices` 时，从"活跃声部最多的键"里
     /// 按分级策略抢占**活跃**声部（T1 释放中最轻 → T2 最轻），直到回到上限内。
     ///

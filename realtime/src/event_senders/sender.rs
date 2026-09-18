@@ -5,7 +5,7 @@ use xsynth_core::channel::{ChannelAudioEvent, ChannelConfigEvent, ChannelEvent};
 
 use crate::util::ReadWriteAtomicU64;
 
-use super::nps::RoughNpsTracker;
+use super::{nps::RoughNpsTracker, EmergencyGate};
 
 pub(super) struct EventSender {
     sender: Sender<ChannelEvent>,
@@ -13,6 +13,7 @@ pub(super) struct EventSender {
     max_nps: Arc<ReadWriteAtomicU64>,
     skipped_notes: [u64; 128],
     ignore_range: RangeInclusive<u8>,
+    gate: Arc<EmergencyGate>,
 }
 
 impl EventSender {
@@ -20,6 +21,7 @@ impl EventSender {
         max_nps: Arc<ReadWriteAtomicU64>,
         sender: Sender<ChannelEvent>,
         ignore_range: RangeInclusive<u8>,
+        gate: Arc<EmergencyGate>,
     ) -> Result<Self, io::Error> {
         Ok(EventSender {
             sender,
@@ -28,6 +30,7 @@ impl EventSender {
             max_nps,
             skipped_notes: [0; 128],
             ignore_range,
+            gate,
         })
     }
 
@@ -41,11 +44,15 @@ impl EventSender {
                 // 上游 NPS 限流已彻底移除：不存在任何基于 NPS 的 NoteOn 丢弃路径。
                 // `max_nps` 字段保留仅为配置/API 兼容，不再参与丢音决策。
                 let _configured_max_nps = self.max_nps.read();
-                if !self.ignore_range.contains(vel) {
+                if self.ignore_range.contains(vel) {
+                    self.skipped_notes[*key as usize] += 1;
+                } else if !self.gate.allow() {
+                    // 软 NPS 闸（默认关闭）：仅重度过载时临时启用。
+                    // 计入 skipped，对应 NoteOff 会被抵消，避免挂音。
+                    self.skipped_notes[*key as usize] += 1;
+                } else {
                     self.sender.send(ChannelEvent::Audio(event)).ok();
                     self.nps.add_note();
-                } else {
-                    self.skipped_notes[*key as usize] += 1;
                 }
             }
             ChannelAudioEvent::NoteOff { key } => {
@@ -86,6 +93,7 @@ impl Clone for EventSender {
             nps: RoughNpsTracker::disabled(),
             skipped_notes: [0; 128],
             ignore_range: self.ignore_range.clone(),
+            gate: self.gate.clone(),
         }
     }
 }
