@@ -5,7 +5,7 @@ use xsynth_core::channel::{ChannelAudioEvent, ChannelConfigEvent, ChannelEvent};
 
 use crate::util::ReadWriteAtomicU64;
 
-use super::nps::{should_send_for_vel_and_nps, RoughNpsTracker};
+use super::nps::RoughNpsTracker;
 
 pub(super) struct EventSender {
     sender: Sender<ChannelEvent>,
@@ -23,7 +23,8 @@ impl EventSender {
     ) -> Result<Self, io::Error> {
         Ok(EventSender {
             sender,
-            nps: RoughNpsTracker::new()?,
+            // NPS 限流已移除：使用 disabled 追踪器（不启动后台线程）。
+            nps: RoughNpsTracker::disabled(),
             max_nps,
             skipped_notes: [0; 128],
             ignore_range,
@@ -37,12 +38,10 @@ impl EventSender {
                     return;
                 }
 
-                let max_nps = self.max_nps.read();
-                let nps = self.nps.calculate_nps();
-                // max_nps == 0：关闭 NPS 限流（不丢任何 NoteOn）。
-                if (max_nps == 0 || should_send_for_vel_and_nps(*vel, nps, max_nps))
-                    && !self.ignore_range.contains(vel)
-                {
+                // 上游 NPS 限流已彻底移除：不存在任何基于 NPS 的 NoteOn 丢弃路径。
+                // `max_nps` 字段保留仅为配置/API 兼容，不再参与丢音决策。
+                let _configured_max_nps = self.max_nps.read();
+                if !self.ignore_range.contains(vel) {
                     self.sender.send(ChannelEvent::Audio(event)).ok();
                     self.nps.add_note();
                 } else {
@@ -84,7 +83,7 @@ impl Clone for EventSender {
         EventSender {
             sender: self.sender.clone(),
             max_nps: self.max_nps.clone(),
-            nps: RoughNpsTracker::new().unwrap_or_else(|_| RoughNpsTracker::disabled()),
+            nps: RoughNpsTracker::disabled(),
             skipped_notes: [0; 128],
             ignore_range: self.ignore_range.clone(),
         }

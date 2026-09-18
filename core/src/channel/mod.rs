@@ -282,6 +282,16 @@ impl VoiceChannel {
             return;
         }
 
+        // 诊断（XSYNTH_GOV_DEBUG=1）：区分"活跃数未压住"与"缓冲残留滞留"。
+        let debug = std::env::var_os("XSYNTH_GOV_DEBUG").is_some();
+        let active_before = total;
+        let buffer_before: usize = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.voice_count())
+            .sum();
+
+        let mut steals = 0usize;
         while total > cap {
             let Some(idx) = counts
                 .iter()
@@ -297,6 +307,23 @@ impl VoiceChannel {
             }
             counts[idx] -= 1;
             total -= 1;
+            steals += 1;
+        }
+
+        if debug {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static EVENTS: AtomicU64 = AtomicU64::new(0);
+            let n = EVENTS.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(200) {
+                let buffer_after: usize = self
+                    .key_voices
+                    .iter()
+                    .map(|key| key.data.voice_count())
+                    .sum();
+                eprintln!(
+                    "[GOV] #{n} cap={cap} active_before={active_before} active_after={total} buffer_before={buffer_before} buffer_after={buffer_after} steals={steals}",
+                );
+            }
         }
     }
 

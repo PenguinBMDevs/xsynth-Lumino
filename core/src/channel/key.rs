@@ -95,6 +95,11 @@ impl KeyData {
         self.voices.active_voice_count()
     }
 
+    /// 当前缓冲中的声部组总数（含已 Kill 待移除的组，用于诊断）。
+    pub fn voice_count(&self) -> usize {
+        self.voices.voice_count()
+    }
+
     /// 按分级策略抢占一组声部（短淡出 + 死期限）。返回被抢层级。
     pub fn steal_voice_group(&mut self) -> Option<StealTier> {
         self.voices.steal_voice_group()
