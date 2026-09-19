@@ -31,8 +31,7 @@ fn cushion_target_interleaved(
 
 /// Holds the statistics for an instance of BufferedRenderer.
 #[derive(Debug, Clone)]
-struct BufferedRendererStats {
-    samples: Arc<AtomicI64>,
+struct BufferedRendererStats {    samples: Arc<AtomicI64>,
 
     last_samples_after_read: Arc<AtomicI64>,
 
@@ -331,7 +330,7 @@ mod tests {
         },
     };
 
-    use super::{cushion_target_interleaved, BufferedRendererStats, BufferedRendererStatsReader};
+    use super::{BufferedRendererStats, BufferedRendererStatsReader, cushion_target_interleaved};
 
     #[test]
     fn average_renderer_load_is_zero_when_no_samples_have_been_rendered() {

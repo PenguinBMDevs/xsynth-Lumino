@@ -25,8 +25,8 @@ use crate::voice::{
 #[cfg(feature = "voice_probe")]
 mod imp {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     /// 线程本地累加器（热路径只写这里；每 2s 合并进全局）。
