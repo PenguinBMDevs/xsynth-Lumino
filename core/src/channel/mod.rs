@@ -429,7 +429,9 @@ impl VoiceChannel {
         }
 
         // 诊断（XSYNTH_GOV_DEBUG=1）：区分"活跃数未压住"与"缓冲残留滞留"。
-        let debug = std::env::var_os("XSYNTH_GOV_DEBUG").is_some();
+        // 开关只解析一次：每通道每块读取环境变量是 syscall 级开销（重载时 16×100 次/秒）。
+        static GOV_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let debug = *GOV_DEBUG.get_or_init(|| std::env::var_os("XSYNTH_GOV_DEBUG").is_some());
         let active_before = total;
         let buffer_before: usize = self
             .key_voices

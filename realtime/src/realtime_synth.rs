@@ -921,6 +921,10 @@ fn build_render_pipe(
     let mut governor = Governor::new(hard_max_voices, voice_target_ratio);
     // 紧急模式状态（用于检测进入/退出边沿并冲洗队列）。
     let mut prev_emergency = false;
+    // 治理抢占用的复用暂存（每块不再新建两个 Vec + 排序）：
+    // 过载时渲染管道线程与 16 个通道线程同时在分配，这里省掉热路径上的分配器往返。
+    let mut steal_counts: Vec<u64> = Vec::with_capacity(channel_count as usize);
+    let mut steal_order: Vec<usize> = Vec::with_capacity(channel_count as usize);
 
     FunctionAudioPipe::new(stream_params, move |out| {
         let block_start = Instant::now();
@@ -997,14 +1001,17 @@ fn build_render_pipe(
         let want = action.steal.max(action.hard_steal).min(4096);
         if want > 0 {
             let mut deficit = want as u64;
-            let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
-            let mut order: Vec<usize> = (0..channel_count as usize).collect();
-            order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
-            for i in order {
+            // 复用暂存：语义与原「每块新建 Vec」完全一致（同样的取值 + 稳定排序）。
+            steal_counts.clear();
+            steal_counts.extend(channel_stats.iter().map(|c| c.voice_count()));
+            steal_order.clear();
+            steal_order.extend(0..channel_count as usize);
+            steal_order.sort_by_key(|&i| std::cmp::Reverse(steal_counts[i]));
+            for i in steal_order.iter().copied() {
                 if deficit == 0 {
                     break;
                 }
-                let take = counts[i].min(deficit);
+                let take = steal_counts[i].min(deficit);
                 if take == 0 {
                     continue;
                 }
@@ -1012,7 +1019,7 @@ fn build_render_pipe(
                     .send(ChannelCommand::Steal(take as usize))
                     .is_ok()
                 {
-                    counts[i] -= take;
+                    steal_counts[i] -= take;
                     deficit -= take;
                 }
             }
@@ -1030,7 +1037,11 @@ fn build_render_pipe(
 
         // 治理诊断（受 XSYNTH_GOV_DEBUG 控制）：异常时 1s 一次，正常时 5s 一次，
         // 始终输出 V/soft/def，便于观察撞墙与积压情况。
-        if std::env::var_os("XSYNTH_GOV_DEBUG").is_some() {
+        //
+        // 开关在进程内只解析一次：`env::var_os` 在 Windows 上是环境查询 syscall，
+        // 放在每块（100 次/秒）的渲染管道上属于纯浪费。
+        static GOV_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *GOV_DEBUG.get_or_init(|| std::env::var_os("XSYNTH_GOV_DEBUG").is_some()) {
             static LAST_LOG: AtomicU64 = AtomicU64::new(0);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
