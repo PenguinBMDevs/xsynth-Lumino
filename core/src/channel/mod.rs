@@ -222,20 +222,16 @@ impl VoiceChannel {
                 }
                 None => {
                     for key in self.key_voices.iter_mut() {
-                        crate::profiling::tracy_zone!("key_events", {
-                            for e in key.event_cache.drain(..) {
-                                key.data.send_event(
-                                    e,
-                                    &self.voice_control_data,
-                                    &self.params.channel_sf,
-                                    self.params.layers,
-                                );
-                            }
-                        });
+                        for e in key.event_cache.drain(..) {
+                            key.data.send_event(
+                                e,
+                                &self.voice_control_data,
+                                &self.params.channel_sf,
+                                self.params.layers,
+                            );
+                        }
 
-                        crate::profiling::tracy_zone!("key_render", {
-                            key.data.render_to(out);
-                        });
+                        key.data.render_to(out);
                     }
                 }
             }
