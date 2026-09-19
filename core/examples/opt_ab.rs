@@ -12,9 +12,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use xsynth_core::{
-    AudioPipe, AudioStreamParams, ChannelCount,
     channel::{ChannelAudioEvent, ChannelConfigEvent, ChannelEvent, VoiceChannel},
     soundfont::{SampleSoundfont, SoundfontBase},
+    AudioPipe, AudioStreamParams, ChannelCount,
 };
 
 fn main() {
@@ -39,7 +39,15 @@ fn main() {
     channel.process_event(ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(
         soundfonts,
     )));
-    channel.process_event(ChannelEvent::Config(ChannelConfigEvent::SetLayerCount(None)));
+    // `LAYERS=<n>` 复现 app 实时后端的每键上限（lumino `xsynth_max_voices_per_key` 默认 4）；
+    // 不设置 = 不限制（历史基线口径，保持既有哈希基准可比）。
+    let layers: Option<usize> = std::env::var("LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0);
+    channel.process_event(ChannelEvent::Config(ChannelConfigEvent::SetLayerCount(
+        layers,
+    )));
 
     let mut rng: StdRng = SeedableRng::from_seed([7u8; 32]);
     let mut buffer = vec![0.0f32; 960];
