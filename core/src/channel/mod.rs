@@ -226,6 +226,12 @@ impl VoiceChannel {
             self.enforce_max_voices();
         });
 
+        // A/B 归一化基准：本块渲染前的活跃声部数（= 本块工作量）。
+        // 跨 run 比较时用它把 DSP 耗时换算成 ns/voice-block，消除"渲染内容漂移"
+        // 造成的负载差异（见 profiling.rs `tracy_plot` 说明）。未启用 tracy 时零开销。
+        #[cfg(feature = "tracy")]
+        crate::profiling::tracy_plot!("ch_voices", self.count_voices() as f64);
+
         // 3) 渲染（可并行）。
         out.fill(0.0);
         crate::profiling::tracy_zone!("channel_keys", {
@@ -467,8 +473,16 @@ impl VoiceChannel {
         }
     }
 
-    fn propagate_voice_controls(&mut self) {
-        for key in self.key_voices.iter_mut() {
+    /// 通道内缓冲中的声部总数：A/B 渲染工作量归一化基准（仅 tracy 构建调用）。
+    #[cfg(feature = "tracy")]
+    fn count_voices(&self) -> usize {
+        self.key_voices
+            .iter()
+            .map(|key| key.data.voice_count())
+            .sum()
+    }
+
+    fn propagate_voice_controls(&mut self) {        for key in self.key_voices.iter_mut() {
             key.data.process_controls(&self.voice_control_data);
         }
     }

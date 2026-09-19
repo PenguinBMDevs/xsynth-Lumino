@@ -29,3 +29,29 @@ macro_rules! tracy_zone {
 }
 
 pub(crate) use tracy_zone;
+
+/// 发射一条 Tracy 数值曲线点（用于 A/B 的工作量归一化基准，如每块活跃声部数）。
+///
+/// 用法：`crate::profiling::tracy_plot!("ch_voices", count as f64)`
+///
+/// 为什么需要：跨 run 的 A/B 里「同一段音频的渲染内容」会因过载漂移而不可比
+/// （播放位置与渲染进度脱钩），用每块声部数（工作量）做基准即可得到与内容无关的
+/// ns/voice-block 口径，避免拿被负载差异污染的总量比值当结论。
+#[cfg(feature = "tracy")]
+macro_rules! tracy_plot {
+    ($name:literal, $value:expr) => {{
+        if let Some(client) = tracy_client::Client::running() {
+            client.plot(tracy_client::plot_name!($name), $value as f64);
+        }
+    }};
+}
+
+/// 未启用 `tracy` feature 时的空操作版本（零开销）。
+#[cfg(not(feature = "tracy"))]
+macro_rules! tracy_plot {
+    ($name:literal, $value:expr) => {{
+        let _ = $value;
+    }};
+}
+
+pub(crate) use tracy_plot;
