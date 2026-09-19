@@ -1028,10 +1028,15 @@ impl BatchLane {
                 None => false,
             },
             // `SampleReaderLoop::is_past_end` 恒为 false；
-            // `SampleReaderLoopSustain` 用 stop/length 与冻结的 last 判定（原样镜像）。
+            // `SampleReaderLoopSustain` 用 stop/length 与冻结的 last 判定（原样镜像，
+            // 公式与 `sampler.rs` 的读取器必须**逐式一致**）：
+            // 未释放时 `last` 跟随当前位置 → 恒不越界（长音可无限播放）；
+            // 释放后 `last` 冻结 → 线性外推越过 `len` 才越界。
+            // 注意不可改写成 `pos >= len.saturating_sub(last + offset)`——那是符号
+            // 翻转的错误代数，会让所有 sustain 长音在样本长度一半处被硬切。
             LoopMode::LoopContinuous => false,
             LoopMode::LoopSustain => match side.length {
-                Some(len) => pos >= len.saturating_sub(side.last.saturating_add(side.offset)),
+                Some(len) => pos.saturating_sub(side.last).saturating_sub(side.offset) >= len,
                 None => false,
             },
         }

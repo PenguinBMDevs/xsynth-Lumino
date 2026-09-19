@@ -731,6 +731,62 @@ mod tests {
         run();
     }
 
+    /// 回归（用户可感知症状：**长音播不完、音符被直接杀掉**）：
+    /// 按住不放的 Sustain 循环声部在渲染 N 块后必须仍然 `alive`。
+    ///
+    /// 历史缺陷：`SampleReaderLoopSustain::is_past_end` 的符号翻转使读者在播放到
+    /// 样本长度一半时就报告越界 → `ended()` 为真 → `VoiceBuffer` 直接移除声部
+    /// （硬切，没有 release 尾巴）。测试渲染 60 块（28_800 帧 = 样本长度的 3.5 倍），
+    /// 真实链路与批 voice 都不得结束，且末块仍在发声。
+    #[test]
+    fn held_sustain_voice_is_not_killed_early() {
+        simd_runtime_generate!(
+            fn run() {
+                const BLOCKS: usize = 60;
+                for filter in [true, false] {
+                    for interpolator in [Interpolator::Nearest, Interpolator::Linear] {
+                        let s = spawner::<S>(
+                            LoopMode::LoopSustain,
+                            interpolator,
+                            filter,
+                            EnvelopeOptions::default(),
+                            0.4,
+                            100,
+                        );
+                        let control = VoiceControlData::new_defaults();
+                        let mut real = s.begin_voice_impl(&control, false, false);
+                        let mut batch = s.begin_voice_impl(&control, true, false);
+
+                        let mut buf = vec![0.0f32; FRAMES * 2];
+                        for block in 0..BLOCKS {
+                            buf.fill(0.0);
+                            real.render_to(&mut buf);
+                            assert!(
+                                !real.ended(),
+                                "未释放的真实链路声部在第 {block} 块被判结束（长音被硬切）: \
+                                 {interpolator:?} filter={filter}"
+                            );
+                            buf.fill(0.0);
+                            batch.render_to(&mut buf);
+                            assert!(
+                                !batch.ended(),
+                                "未释放的批 voice 在第 {block} 块被判结束（长音被硬切）: \
+                                 {interpolator:?} filter={filter}"
+                            );
+                        }
+
+                        assert!(
+                            buf.iter().any(|s| s.abs() > 1e-3),
+                            "末块应仍在发声（包络处于 Sustain）: {interpolator:?} filter={filter}"
+                        );
+                    }
+                }
+            }
+        );
+
+        run();
+    }
+
     /// B1 内核 vs 真实链路（同参数、同长度、min-of-N 交错）——真实 lane 实现的
     /// 单 voice 成本，用于判断批处理收益是否被标量部分（采样/包络）吃掉。
     ///

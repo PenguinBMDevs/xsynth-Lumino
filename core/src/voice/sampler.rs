@@ -263,9 +263,21 @@ impl<Sampler: BufferSampler> SampleReader for SampleReaderLoopSustain<Sampler> {
         self.buffer.get(pos)
     }
 
+    /// 越界判据：**「距上次读取位置推进了多远」是否已超过声明长度**。
+    ///
+    /// - 未释放：`get` 每次都把 `last` 更新为当前（未回绕）位置，`pos - last` 恒为
+    ///   0/1 → **永不越界**。Sustain 循环在按键期间可以无限播放，声部只由包络
+    ///   （release → Finished）结束。**这一条是长音能播完的前提**。
+    /// - 已释放：`last` 冻结在释放点，`pos - last` 随线性外推增长，越过 `len`
+    ///   （`loop_params.stop` 或缓冲长度）即越界，声部结束。
+    ///
+    /// 必须写成 `pos - last - offset` 的左结合形式：`pos >= len - (last + offset)`
+    /// 是**错误的代数改写**（符号翻转，`last` 未释放时无界增长会让右边饱和到 0 →
+    /// 恒为真，所有 sustain 长音在播放到样本长度一半时被硬切）。
+    /// 用 saturating 减法表达同样的数学含义，同时避免 `offset > 0` 时的 usize 下溢 panic。
     fn is_past_end(&self, pos: usize) -> bool {
         if let Some(len) = self.length {
-            pos >= len.saturating_sub(self.last + self.offset)
+            pos.saturating_sub(self.last).saturating_sub(self.offset) >= len
         } else {
             false
         }
@@ -438,7 +450,12 @@ where
     Pitch: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
     Grabber: SIMDSampleGrabber<S>,
 {
-    pub fn new(grabber_left: Grabber, grabber_right: Grabber, pitch_gen: Pitch, probe: bool) -> Self {
+    pub fn new(
+        grabber_left: Grabber,
+        grabber_right: Grabber,
+        pitch_gen: Pitch,
+        probe: bool,
+    ) -> Self {
         SIMDStereoVoiceSampler {
             grabber_left,
             grabber_right,
@@ -521,6 +538,97 @@ where
 
 #[cfg(test)]
 mod tests {
+    use xsynth_soundfonts::LoopMode;
+
+    use super::*;
+
+    fn ramp_buffer(len: usize) -> BufferSamplers {
+        let data: Arc<[f32]> = (0..len)
+            .map(|i| i as f32 * 0.001)
+            .collect::<Vec<_>>()
+            .into();
+        BufferSamplers::new_f32(data)
+    }
+
+    /// 回归（**长音被直接杀掉** 的根因）：未释放的 Sustain 循环**永不**判定越界。
+    ///
+    /// 缺陷来自 `2d8a15a` 的代数改写：`pos - last - offset >= len` 被改成
+    /// `pos >= len - (last + offset)`——符号翻转。`last` 是「未回绕」的读取位置，
+    /// 未释放时随 `pos` 一起增长，于是阈值 `len - last - offset` 一路下降：
+    /// 大约播放到样本长度**一半**时 `is_past_end` 就变真 → `VoiceBuffer::remove_ended_voices`
+    /// 直接把声部移除（不是 release，是硬切）→ 听感即「长音播不完、音符被杀」。
+    ///
+    /// 本测试锁死语义：
+    /// - 未释放：任意播放位置都不越界（Sustain 循环可无限播放，声部只由包络结束）；
+    /// - 释放后：`last` 冻结，位置线性外推越过样本末尾 → 必须越界（否则声部滞留）。
+    #[test]
+    fn sustain_loop_is_never_past_end_while_held() {
+        const LEN: usize = 2_048;
+        for offset in [0u32, 37] {
+            let mut reader = SampleReaderLoopSustain::new(
+                ramp_buffer(LEN),
+                LoopParams {
+                    mode: LoopMode::LoopSustain,
+                    offset,
+                    start: 256,
+                    end: 1_024,
+                    stop: None,
+                },
+            );
+
+            // 播放 32 倍样本长度：覆盖「未回绕位置远超 len」与「回绕若干圈」两种状态。
+            for pos in 0..LEN * 32 {
+                let _ = reader.get(pos);
+                assert!(
+                    !reader.is_past_end(pos),
+                    "未释放的 sustain 循环在 pos={pos}（offset={offset}）被判越界——长音会被硬切"
+                );
+            }
+
+            reader.signal_release();
+            let release_pos = LEN * 32;
+            let ended_after = (release_pos..release_pos + LEN * 8)
+                .find(|&pos| {
+                    let _ = reader.get(pos);
+                    reader.is_past_end(pos)
+                })
+                .unwrap_or_else(|| panic!("释放后应最终判越界（offset={offset}）"));
+            // 释放后必须至少再走完「声明长度」（-1 帧取整）才允许越界；提前触发 = 尾巴被砍。
+            assert!(
+                ended_after >= release_pos + LEN - 1,
+                "释放后越界触发过早（release 尾巴被砍）: ended_after={ended_after} \
+                 release_pos={release_pos} offset={offset}"
+            );
+        }
+    }
+
+    /// 回归（防止同一处再被"简化"错）：NoLoop 的越界判据是「读取位置 + offset 越过声明长度」。
+    #[test]
+    fn no_loop_past_end_uses_position_plus_offset() {
+        const LEN: usize = 1_024;
+        for offset in [0u32, 37] {
+            let buffer = ramp_buffer(LEN);
+            let mut reader = SampleReaderNoLoop::new(
+                buffer,
+                LoopParams {
+                    mode: LoopMode::NoLoop,
+                    offset,
+                    start: 0,
+                    end: 0,
+                    stop: None,
+                },
+            );
+            for pos in 0..LEN * 2 {
+                let _ = reader.get(pos);
+                assert_eq!(
+                    reader.is_past_end(pos),
+                    pos + offset as usize >= LEN,
+                    "NoLoop 越界判据必须等价于「pos + offset >= len」: pos={pos} offset={offset}"
+                );
+            }
+        }
+    }
+
     /// 优化前后行为一致性：`time % 1.0` 与「截断 + 差值」在非负时间上逐位等价。
     #[test]
     fn fraction_optimization_matches_fmod() {
