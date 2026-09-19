@@ -193,45 +193,57 @@ impl VoiceChannel {
         self.params.load_program();
 
         out.fill(0.0);
-        match self.threadpool.as_ref() {
-            Some(pool) => {
-                let len = out.len();
-                let key_voices = &mut self.key_voices;
-                let params = &self.params;
-                let control_data = &self.voice_control_data;
-                pool.install(|| {
-                    key_voices.par_iter_mut().for_each(move |key| {
-                        for e in key.event_cache.drain(..) {
-                            key.data
-                                .send_event(e, control_data, &params.channel_sf, params.layers);
-                        }
+        crate::profiling::tracy_zone!("channel_keys", {
+            match self.threadpool.as_ref() {
+                Some(pool) => {
+                    let len = out.len();
+                    let key_voices = &mut self.key_voices;
+                    let params = &self.params;
+                    let control_data = &self.voice_control_data;
+                    pool.install(|| {
+                        key_voices.par_iter_mut().for_each(move |key| {
+                            for e in key.event_cache.drain(..) {
+                                key.data.send_event(
+                                    e,
+                                    control_data,
+                                    &params.channel_sf,
+                                    params.layers,
+                                );
+                            }
 
-                        prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
-                        key.data.render_to(&mut key.audio_cache);
+                            prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
+                            key.data.render_to(&mut key.audio_cache);
+                        });
                     });
-                });
 
-                for key in self.key_voices.iter() {
-                    sum_simd(&key.audio_cache, out);
-                }
-            }
-            None => {
-                for key in self.key_voices.iter_mut() {
-                    for e in key.event_cache.drain(..) {
-                        key.data.send_event(
-                            e,
-                            &self.voice_control_data,
-                            &self.params.channel_sf,
-                            self.params.layers,
-                        );
+                    for key in self.key_voices.iter() {
+                        sum_simd(&key.audio_cache, out);
                     }
+                }
+                None => {
+                    for key in self.key_voices.iter_mut() {
+                        crate::profiling::tracy_zone!("key_events", {
+                            for e in key.event_cache.drain(..) {
+                                key.data.send_event(
+                                    e,
+                                    &self.voice_control_data,
+                                    &self.params.channel_sf,
+                                    self.params.layers,
+                                );
+                            }
+                        });
 
-                    key.data.render_to(out);
+                        crate::profiling::tracy_zone!("key_render", {
+                            key.data.render_to(out);
+                        });
+                    }
                 }
             }
-        }
+        });
 
-        self.apply_channel_effects(out);
+        crate::profiling::tracy_zone!("channel_effects", {
+            self.apply_channel_effects(out);
+        });
     }
 
     fn propagate_voice_controls(&mut self) {

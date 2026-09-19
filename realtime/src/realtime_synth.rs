@@ -293,6 +293,11 @@ impl RealtimeSynth {
         device: &Device,
         stream_config: SupportedStreamConfig,
     ) -> Result<Self, RealtimeSynthError> {
+        #[cfg(feature = "tracy")]
+        {
+            // Tracy 客户端为进程级单例；重复调用幂等（管线重建场景安全）。
+            let _ = tracy_client::Client::start();
+        }
         let sample_rate = stream_config.sample_rate().0;
         let stream_params = AudioStreamParams::new(sample_rate, stream_config.channels().into());
         let channel_pool = build_channel_pool(config.multithreading)?;
@@ -613,13 +618,21 @@ fn spawn_channel_thread(
             let mut cur_gain = 1.0f32;
             let mut cur_pan = 0.0f32;
             loop {
-                channel.push_events_iter(event_receiver.try_iter());
-                let mut vec = match command_receiver.recv() {
+                crate::profiling::tracy_zone!("ch_drain_events", {
+                    channel.push_events_iter(event_receiver.try_iter());
+                });
+                let mut vec = match crate::profiling::tracy_zone!("ch_wait_render", {
+                    command_receiver.recv()
+                }) {
                     Ok(vec) => vec,
                     Err(_) => break,
                 };
-                channel.push_events_iter(event_receiver.try_iter());
-                channel.read_samples(&mut vec);
+                crate::profiling::tracy_zone!("ch_drain_events_late", {
+                    channel.push_events_iter(event_receiver.try_iter());
+                });
+                crate::profiling::tracy_zone!("ch_render_samples", {
+                    channel.read_samples(&mut vec);
+                });
                 // 音频域混音：立体声交织缓冲施加增益 + 等功率声像。
                 let tgt_gain =
                     f32::from_bits(mix[channel_index as usize].gain.load(Ordering::Relaxed))
@@ -666,17 +679,21 @@ fn build_render_pipe(
     let total_voice_count = stats.voice_count.clone();
 
     FunctionAudioPipe::new(stream_params, move |out| {
-        for sender in &command_senders {
-            let mut buf = vec_cache.pop_front().unwrap();
-            prepapre_cache_vec(&mut buf, out.len(), 0.0);
-            sender.send(buf).unwrap();
-        }
+        crate::profiling::tracy_zone!("pipe_dispatch", {
+            for sender in &command_senders {
+                let mut buf = vec_cache.pop_front().unwrap();
+                prepapre_cache_vec(&mut buf, out.len(), 0.0);
+                sender.send(buf).unwrap();
+            }
+        });
 
-        for _ in 0..channel_count {
-            let buf = output_receiver.recv().unwrap();
-            sum_simd(&buf, out);
-            vec_cache.push_front(buf);
-        }
+        crate::profiling::tracy_zone!("pipe_collect_sum", {
+            for _ in 0..channel_count {
+                let buf = output_receiver.recv().unwrap();
+                sum_simd(&buf, out);
+                vec_cache.push_front(buf);
+            }
+        });
 
         // 主输出实时响度峰值：汇总后的 `out` 即最终混音（限幅前），
         // 同通道峰值做衰减 + 取大。
@@ -739,11 +756,14 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
     Ok(device.build_output_stream(
         &stream_config.into(),
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            output_vec.resize(data.len(), 0.0);
-            buffered.lock().unwrap().read(&mut output_vec);
-            for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
-                data[i] = ConvertSample::from_f32(s);
-            }
+            crate::profiling::tracy_zone!("audio_callback", {
+                output_vec.resize(data.len(), 0.0);
+                buffered.lock().unwrap().read(&mut output_vec);
+                for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
+                    data[i] = ConvertSample::from_f32(s);
+                }
+            });
+            crate::profiling::tracy_frame!();
         },
         err_fn,
         None,

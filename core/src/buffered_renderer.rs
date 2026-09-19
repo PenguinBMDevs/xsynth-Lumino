@@ -164,7 +164,9 @@ impl BufferedRenderer {
                     // Create the vec and write the samples
                     let mut vec =
                         vec![Default::default(); size * stream_params.channels.count() as usize];
-                    render.read_samples(&mut vec);
+                    crate::profiling::tracy_zone!("buffered_render_chunk", {
+                        render.read_samples(&mut vec);
+                    });
 
                     // Send the samples, break if the pipe is broken
                     samples.fetch_add(vec.len() as i64, Ordering::SeqCst);

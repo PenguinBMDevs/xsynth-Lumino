@@ -1,6 +1,8 @@
 mod config;
 pub use config::*;
 
+mod profiling;
+
 mod util;
 
 pub use xsynth_core::channel_group::SynthEvent;
