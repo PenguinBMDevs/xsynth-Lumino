@@ -142,6 +142,11 @@ struct LaneEnvelope {
     group_left: u8,
     /// 当前组是否已进入逐帧 scalar 公式路径。
     group_manual: bool,
+    /// 组缓冲：一次填满 `group_len` 帧的包络值（镜像真实实现一次 `next_sample`
+    /// 产生一整组值；控制消息/Release 只可能在组边界到达，与真实粒度一致）。
+    fifo: [f32; MAX_LANES],
+    /// 组缓冲中已消费的帧数（`group_len` 表示需要重填）。
+    fifo_pos: u8,
 }
 
 impl LaneEnvelope {
@@ -165,6 +170,8 @@ impl LaneEnvelope {
             group_len,
             group_left: group_len,
             group_manual: false,
+            fifo: [0.0; MAX_LANES],
+            fifo_pos: group_len,
         };
         let start = params.start_amplitude();
         env.set_stage(EnvelopeStage::Delay, start);
@@ -291,9 +298,10 @@ impl LaneEnvelope {
         self.set_stage(self.stage, amp);
     }
 
-    /// 产生下一帧的包络值（镜像 `next_sample_inner` + `manually_build_simd_sample`）。
+    /// 逐帧 scalar 步进（镜像 `next_sample_inner` 的手动路径与 `Constant` 分支）。
+    /// `self.t` 语义：**下一个待产生帧**的阶段时间（组边界上与真实实现完全一致）。
     #[inline(always)]
-    fn next_frame(&mut self) -> f32 {
+    fn frame_scalar(&mut self) -> f32 {
         loop {
             match self.data {
                 LaneCurve::Constant(value) => {
@@ -327,6 +335,105 @@ impl LaneEnvelope {
         }
     }
 
+    /// 组填充（慢路径）：逐帧 scalar，复用已验证的逐帧状态机，可跨阶段切换。
+    fn fill_slow(&mut self) {
+        for i in 0..self.group_len as usize {
+            self.fifo[i] = self.frame_scalar();
+        }
+        self.fifo_pos = 0;
+    }
+
+    /// 组填充（快路径）：整组落在同一阶段内（或 `Constant`）→ 一次向量计算。
+    ///
+    /// 与 `fill_slow` 逐位等价：Lerp 公式两端相同；Concave/Convex 使用真实实现
+    /// `lerp_simd` 的显式三次平方公式（手动路径才用 `powi`），且调用条件是
+    /// 「本组不越阶段末尾」，正好对应真实实现的 case A。
+    #[inline(always)]
+    fn fill_fast<S: Simd>(&mut self) {
+        if let LaneCurve::Constant(value) = self.data {
+            for i in 0..self.group_len as usize {
+                self.fifo[i] = value;
+            }
+            self.group_left = self.group_len;
+            self.fifo_pos = 0;
+            return;
+        }
+
+        simd_invoke!(S, {
+            let n = S::Vf32::WIDTH;
+            let mut idx = S::Vf32::zeroes();
+            for i in 0..n {
+                idx[i] = i as f32;
+            }
+            // 等价于真实 `StageTime::new` + `progress_simd_array`。
+            let factor = (S::Vf32::set1(self.t as f32) + idx) / S::Vf32::set1(self.end as f32);
+            let values = match self.data {
+                LaneCurve::Lerp { start, length } => {
+                    S::Vf32::set1(start) + S::Vf32::set1(length) * factor
+                }
+                LaneCurve::Concave { length, end } => {
+                    let r1 = S::Vf32::set1(1.0) - factor;
+                    let r2 = r1 * r1;
+                    let r3 = r2 * r2;
+                    let mult = r3 * r3;
+                    S::Vf32::set1(length) * mult + S::Vf32::set1(end)
+                }
+                LaneCurve::Convex { start, length } => {
+                    let r1 = factor * factor;
+                    let r2 = r1 * r1;
+                    let mult = r2 * r2;
+                    S::Vf32::set1(length) * mult + S::Vf32::set1(start)
+                }
+                LaneCurve::Constant(value) => S::Vf32::set1(value),
+            };
+            let mut arr = [0.0f32; MAX_LANES];
+            values.copy_to_slice(&mut arr);
+            self.fifo = arr;
+        });
+
+        self.t += self.group_len as u32;
+        self.group_left = self.group_len;
+        self.group_manual = false;
+        self.fifo_pos = 0;
+    }
+
+    /// 组边界重填（内核路径：能整组向量化时走快路径）。
+    #[inline(always)]
+    fn refill_simd<S: Simd>(&mut self) {
+        let n = self.group_len as u32;
+        let fast = match self.data {
+            LaneCurve::Constant(_) => true,
+            _ => self.t + (n - 1) < self.end,
+        };
+        if fast {
+            self.fill_fast::<S>();
+        } else {
+            self.fill_slow();
+        }
+    }
+
+    /// 内核入口：消费组缓冲中的下一帧（镜像 `next_sample` 的 8 帧粒度）。
+    #[inline(always)]
+    fn next_frame_simd<S: Simd>(&mut self) -> f32 {
+        if self.fifo_pos >= self.group_len {
+            self.refill_simd::<S>();
+        }
+        let value = self.fifo[self.fifo_pos as usize];
+        self.fifo_pos += 1;
+        value
+    }
+
+    /// 标量入口（非批回退路径与差分测试参考实现）：逐帧 scalar 组填充。
+    #[inline(always)]
+    fn next_frame(&mut self) -> f32 {
+        if self.fifo_pos >= self.group_len {
+            self.fill_slow();
+        }
+        let value = self.fifo[self.fifo_pos as usize];
+        self.fifo_pos += 1;
+        value
+    }
+
     fn signal_release(&mut self, rel_type: ReleaseType) {
         if rel_type == ReleaseType::Kill {
             self.params.modify_stage_data(
@@ -354,6 +461,193 @@ impl LaneEnvelope {
     #[inline(always)]
     fn ended(&self) -> bool {
         self.stage == EnvelopeStage::Finished
+    }
+}
+
+/// 循环模式热标记（避免热循环内做 `LoopMode` 枚举匹配）。
+const HOT_MODE_NOLOOP: u8 = 0;
+const HOT_MODE_LOOP: u8 = 1;
+const HOT_MODE_SUSTAIN: u8 = 2;
+
+/// 回绕：镜像 `SampleReaderLoop`/`SampleReaderLoopSustain` 的 `pos > end` 分支。
+#[inline(always)]
+fn wrap_pos(pos: usize, start: usize, end: usize) -> usize {
+    let span = end - start;
+    let d = pos - end - 1;
+    start + if d >= span { d % span } else { d }
+}
+
+/// 每 lane 的采样热状态。
+///
+/// 每 chunk 从 `BatchLane` 裁剪一次（指针/长度/回绕边界/模式标记全部展平到连续
+/// 内存），热循环内不再穿过 `&mut BatchLane` → `BufferSamplers` 枚举 → `Arc` 间接
+/// 的多级寻址。加载/回绕均保持与真实 reader 逐位相同的语义。
+///
+/// # Safety
+/// `ptr_l/ptr_r` 指向 lane 持有的 `Arc<[f32]>` 数据；chunk 渲染期间 lane 不被结构性
+/// 修改（`Arc` 不会被释放或替换），因此指针在 chunk 内有效。
+#[derive(Clone, Copy)]
+struct HotLane {
+    ptr_l: *const f32,
+    ptr_r: *const f32,
+    len_l: usize,
+    len_r: usize,
+    off_l: usize,
+    off_r: usize,
+    end_l: usize,
+    end_r: usize,
+    start: usize,
+    last_l: usize,
+    last_r: usize,
+    time: f64,
+    speed: f32,
+    gain_l: f32,
+    gain_r: f32,
+    mode: u8,
+    interp: u8,
+    /// `LoopSustain` 且已释放（位置线性外推，可能越界 → 必须走有检查加载）。
+    released: bool,
+    /// 循环模式下回绕后位置必然在缓冲内（含线性插值的 `+1` 余量）→ 无检查加载。
+    in_range: bool,
+}
+
+impl HotLane {
+    const EMPTY: HotLane = HotLane {
+        ptr_l: std::ptr::null(),
+        ptr_r: std::ptr::null(),
+        len_l: 0,
+        len_r: 0,
+        off_l: 0,
+        off_r: 0,
+        end_l: 0,
+        end_r: 0,
+        start: 0,
+        last_l: 0,
+        last_r: 0,
+        time: 0.0,
+        speed: 0.0,
+        gain_l: 0.0,
+        gain_r: 0.0,
+        mode: 0,
+        interp: 0,
+        released: false,
+        in_range: false,
+    };
+
+    /// 镜像 `F32BufferSampler::get`：越界返回 0.0（`in_range` 时证明不可能越界）。
+    #[inline(always)]
+    fn load(&self, pos: usize, ptr: *const f32, len: usize) -> f32 {
+        if self.in_range || pos < len {
+            // SAFETY: `in_range` 由构造期证明（回绕后位置 + 线性余量 ≤ 缓冲长度），
+            // 否则显式做了 `pos < len` 检查；`ptr` 由 lane 持有的 Arc 保证有效。
+            unsafe { *ptr.add(pos) }
+        } else {
+            0.0
+        }
+    }
+
+    /// 消融用：无分支采样（恒定 in_range、nearest、无回绕检查）——仅用于定位
+    /// 计时瓶颈，语义不完整，不参与正确性路径。
+    #[inline(always)]
+    fn sample_step_flat(&mut self) -> (f32, f32) {
+        let t = self.time;
+        self.time = t + self.speed as f64;
+        let index = (t as i32) as usize & 1023;
+        unsafe {
+            (
+                *self.ptr_l.add(index + self.off_l),
+                *self.ptr_r.add(index + self.off_r),
+            )
+        }
+    }
+
+    /// 推进一帧采样（时间 → 索引 → 回绕 → 抓取/插值），返回滤波前的左右样本。
+    #[inline(always)]
+    fn sample_step(&mut self) -> (f32, f32) {
+        let t = self.time;
+        self.time = t + self.speed as f64;
+        let index = t as i32;
+        // `reader.get(pos)` 的入参（未回绕，含 offset）。
+        let base_l = index as usize + self.off_l;
+        let base_r = index as usize + self.off_r;
+
+        let sustain = self.mode == HOT_MODE_SUSTAIN;
+        if sustain && !self.released {
+            // 未释放：`SampleReaderLoopSustain::get` 每次都更新 `last`（未回绕值）；
+            // 线性插值连续读 index 与 index+1 → `last` 最终为 index+1。
+            self.last_l = if self.interp == 1 { base_l + 1 } else { base_l };
+            self.last_r = if self.interp == 1 { base_r + 1 } else { base_r };
+        }
+
+        let (pos_l, pos_r) = if sustain && self.released {
+            // 释放后：冻结 last、按剩余偏移线性推进（位置可能越界）。
+            (
+                base_l.wrapping_sub(self.last_l).wrapping_add(self.end_l),
+                base_r.wrapping_sub(self.last_r).wrapping_add(self.end_r),
+            )
+        } else if self.mode == HOT_MODE_NOLOOP {
+            // `SampleReaderNoLoop::get` = `buffer.get(pos + offset)`：**不回绕**，
+            // 越界由有检查加载返回 0.0。
+            (base_l, base_r)
+        } else {
+            (
+                if base_l > self.end_l {
+                    wrap_pos(base_l, self.start, self.end_l)
+                } else {
+                    base_l
+                },
+                if base_r > self.end_r {
+                    wrap_pos(base_r, self.start, self.end_r)
+                } else {
+                    base_r
+                },
+            )
+        };
+
+        if self.interp == 0 {
+            (
+                self.load(pos_l, self.ptr_l, self.len_l),
+                self.load(pos_r, self.ptr_r, self.len_r),
+            )
+        } else {
+            // 线性插值：真实实现是第二次 `reader.get(index+1)`——**独立**回绕，
+            // 不能用 `pos + 1`（`pos == loop_end` 时两者不同）。
+            let (pos_l1, pos_r1) = self.advance_one(base_l, base_r, self.released);
+            let frac = (t - index as f64) as f32;
+            let l0 = self.load(pos_l, self.ptr_l, self.len_l);
+            let l1 = self.load(pos_l1, self.ptr_l, self.len_l);
+            let r0 = self.load(pos_r, self.ptr_r, self.len_r);
+            let r1 = self.load(pos_r1, self.ptr_r, self.len_r);
+            (l0 * (1.0 - frac) + l1 * frac, r0 * (1.0 - frac) + r1 * frac)
+        }
+    }
+
+    /// `index + 1` 的回绕（与 `sample_step` 中首个位置同语义，供线性插值使用）。
+    #[inline(always)]
+    fn advance_one(&self, base_l: usize, base_r: usize, released_sustain: bool) -> (usize, usize) {
+        let base_l = base_l + 1;
+        let base_r = base_r + 1;
+        if released_sustain {
+            (
+                base_l.wrapping_sub(self.last_l).wrapping_add(self.end_l),
+                base_r.wrapping_sub(self.last_r).wrapping_add(self.end_r),
+            )
+        } else if self.mode == HOT_MODE_NOLOOP {
+            (base_l, base_r)
+        } else {
+            (
+                if base_l > self.end_l {
+                    wrap_pos(base_l, self.start, self.end_l)
+                } else {
+                    base_l
+                },
+                if base_r > self.end_r {
+                    wrap_pos(base_r, self.start, self.end_r)
+                } else {
+                    base_r
+                },
+            )
+        }
     }
 }
 
@@ -474,6 +768,73 @@ impl BatchLane {
         self.filter_enabled
     }
 
+    /// 循环模式热标记。
+    #[inline(always)]
+    fn hot_mode(&self) -> u8 {
+        match self.loop_mode {
+            LoopMode::NoLoop | LoopMode::OneShot => HOT_MODE_NOLOOP,
+            LoopMode::LoopContinuous => HOT_MODE_LOOP,
+            LoopMode::LoopSustain => HOT_MODE_SUSTAIN,
+        }
+    }
+
+    /// `LoopSustain` 且已进入释放后的线性外推分支。
+    #[inline(always)]
+    fn released_sustain(&self) -> bool {
+        self.loop_mode == LoopMode::LoopSustain && self.is_released
+    }
+
+    /// 回绕后位置是否必然落在缓冲内（可走无检查加载）。
+    ///
+    /// 循环模式下位置 ∈ [loop_start, loop_end]；线性插值还要多读一个样本。
+    #[inline(always)]
+    fn in_range_now(&self, linear: bool) -> bool {
+        let mode = self.hot_mode();
+        if mode == HOT_MODE_NOLOOP || self.released_sustain() {
+            return false;
+        }
+        let slack = if linear { 2 } else { 1 };
+        self.loop_end.saturating_add(slack) <= self.left.buffer.slice().len()
+            && self.loop_end.saturating_add(slack) <= self.right.buffer.slice().len()
+    }
+
+    /// 把 lane 的采样热状态展平（每 chunk 一次；见 [`HotLane`]）。
+    #[inline(always)]
+    fn hot(&self) -> HotLane {
+        let left = self.left.buffer.slice();
+        let right = self.right.buffer.slice();
+        let linear = self.interpolator == Interpolator::Linear;
+        HotLane {
+            ptr_l: left.as_ptr(),
+            ptr_r: right.as_ptr(),
+            len_l: left.len(),
+            len_r: right.len(),
+            off_l: self.left.offset,
+            off_r: self.right.offset,
+            end_l: self.loop_end,
+            end_r: self.loop_end,
+            start: self.loop_start,
+            last_l: self.left.last,
+            last_r: self.right.last,
+            time: self.time,
+            speed: self.speed,
+            gain_l: self.gain_l,
+            gain_r: self.gain_r,
+            mode: self.hot_mode(),
+            interp: if linear { 1 } else { 0 },
+            released: self.released_sustain(),
+            in_range: self.in_range_now(linear),
+        }
+    }
+
+    /// 回写热状态（每 chunk 一次）。
+    #[inline(always)]
+    fn apply_hot(&mut self, hot: &HotLane) {
+        self.time = hot.time;
+        self.left.last = hot.last_l;
+        self.right.last = hot.last_r;
+    }
+
     /// 一侧的采样读取（逐位镜像 `SampleReaderLoop`/`SampleReaderLoopSustain`/`SampleReaderNoLoop`）。
     #[inline(always)]
     fn read_side(
@@ -536,13 +897,13 @@ impl BatchLane {
         )
     }
 
-    /// 采样 → 包络 → 增益（标量，逐帧；与真实链式顺序一致）。
+    /// 采样（时间推进 + 回绕 + 抓取），不含包络/增益。
     #[inline(always)]
-    fn next_pre_filter(&mut self) -> (f32, f32) {
+    fn next_sample_only(&mut self) -> (f32, f32) {
         let t = self.time;
         self.time = t + self.speed as f64;
         let index = t as i32;
-        let (sl, sr) = match self.interpolator {
+        match self.interpolator {
             Interpolator::Nearest => {
                 let l = self.read_left(index as usize);
                 let r = self.read_right(index as usize);
@@ -558,10 +919,37 @@ impl BatchLane {
                 let r1 = self.read_right(index as usize + 1);
                 (l0 * (1.0 - frac) + l1 * frac, r0 * (1.0 - frac) + r1 * frac)
             }
-        };
+        }
+    }
+
+    /// 采样 + 包络（不含增益；消融计时用，不参与逐位对照）。
+    #[inline(always)]
+    fn next_sample_env(&mut self) -> (f32, f32) {
+        let (sl, sr) = self.next_sample_only();
         let env = self.env.next_frame();
-        // 真实链顺序：gain 常量 × 采样 → 包络 × 结果。
+        (sl * env, sr * env)
+    }
+
+    /// 增益与包络的应用（顺序与真实链一致：`env * (gain * sample)`）。
+    #[inline(always)]
+    fn apply_env_gain(&self, env: f32, sl: f32, sr: f32) -> (f32, f32) {
         (env * (self.gain_l * sl), env * (self.gain_r * sr))
+    }
+
+    /// 采样 → 包络 → 增益（标量包络入口，供非批回退路径使用）。
+    #[inline(always)]
+    fn next_pre_filter(&mut self) -> (f32, f32) {
+        let (sl, sr) = self.next_sample_only();
+        let env = self.env.next_frame();
+        self.apply_env_gain(env, sl, sr)
+    }
+
+    /// 采样 → 包络 → 增益（向量包络入口，供批内核使用）。
+    #[inline(always)]
+    fn next_pre_filter_simd<S: Simd>(&mut self) -> (f32, f32) {
+        let (sl, sr) = self.next_sample_only();
+        let env = self.env.next_frame_simd::<S>();
+        self.apply_env_gain(env, sl, sr)
     }
 
     /// biquad（DF1，与 `BiQuadFilter::process` 逐项一致）。
@@ -647,97 +1035,133 @@ impl BatchLane {
 /// 标量渲染入口（内核单 chunk）。
 ///
 /// 要求 `lanes.len()` 等于运行时 SIMD 宽度，且所有 lane 的 `filter_enabled` 一致。
+/// 统一 chunk（模式/插值/释放状态一致且可证明无越界）走专用内核，否则回退通用内核。
 pub(crate) fn render_batch_chunk(
     lanes: &mut [&mut BatchLane],
     out: &mut [f32],
     frames: usize,
 ) -> bool {
     simd_runtime_generate!(
-        fn render(lanes: &mut [&mut BatchLane], out: &mut [f32], frames: usize) -> bool {
+        fn render(
+            lanes: &mut [&mut BatchLane],
+            out: &mut [f32],
+            frames: usize,
+            uniform: Option<u32>,
+        ) -> bool {
             if lanes.len() != S::Vf32::WIDTH {
                 return false;
             }
-            render_inner::<S>(lanes, out, frames);
+            match uniform {
+                Some(tag) => match tag {
+                    0 => render_uniform::<S, HOT_MODE_NOLOOP, false, false>(lanes, out, frames),
+                    1 => render_uniform::<S, HOT_MODE_NOLOOP, true, false>(lanes, out, frames),
+                    2 => render_uniform::<S, HOT_MODE_LOOP, false, false>(lanes, out, frames),
+                    3 => render_uniform::<S, HOT_MODE_LOOP, true, false>(lanes, out, frames),
+                    4 => render_uniform::<S, HOT_MODE_SUSTAIN, false, false>(lanes, out, frames),
+                    5 => render_uniform::<S, HOT_MODE_SUSTAIN, true, false>(lanes, out, frames),
+                    6 => render_uniform::<S, HOT_MODE_SUSTAIN, false, true>(lanes, out, frames),
+                    _ => render_uniform::<S, HOT_MODE_SUSTAIN, true, true>(lanes, out, frames),
+                },
+                None => render_inner::<S, 3>(lanes, out, frames),
+            }
             true
         }
     );
 
-    render(lanes, out, frames)
+    let uniform = uniform_chunk(lanes).map(|(mode, linear, released)| {
+        // 0/1 = NoLoop(+linear)…，4/5 = Sustain 未释放(+linear)，6/7 = Sustain 已释放(+linear)。
+        let tag = if mode == HOT_MODE_SUSTAIN {
+            4 + u8::from(linear) + u8::from(released) * 2
+        } else {
+            mode * 2 + u8::from(linear)
+        };
+        u32::from(tag)
+    });
+    render(lanes, out, frames, uniform)
 }
 
-fn render_inner<S: Simd>(lanes: &mut [&mut BatchLane], out: &mut [f32], frames: usize) {
+/// 阶段消融入口（测试/调优用）：`mode` 0 = 仅采样；1 = +包络；2 = +增益；
+/// 3 = 完整（+ biquad/混音）。
+pub(crate) fn render_batch_chunk_mode(
+    lanes: &mut [&mut BatchLane],
+    out: &mut [f32],
+    frames: usize,
+    mode: u32,
+) -> bool {
+    simd_runtime_generate!(
+        fn render(lanes: &mut [&mut BatchLane], out: &mut [f32], frames: usize, mode: u32) -> bool {
+            if lanes.len() != S::Vf32::WIDTH {
+                return false;
+            }
+            match mode {
+                0 => render_inner::<S, 0>(lanes, out, frames),
+                1 => render_inner::<S, 1>(lanes, out, frames),
+                2 => render_inner::<S, 2>(lanes, out, frames),
+                4 => render_inner::<S, 4>(lanes, out, frames),
+                _ => render_inner::<S, 3>(lanes, out, frames),
+            }
+            true
+        }
+    );
+
+    render(lanes, out, frames, mode)
+}
+
+fn render_inner<S: Simd, const MODE: u32>(
+    lanes: &mut [&mut BatchLane],
+    out: &mut [f32],
+    frames: usize,
+) {
     let width = S::Vf32::WIDTH;
     debug_assert_eq!(lanes.len(), width);
-    let filter_on = lanes[0].filter_enabled;
 
     // 必须在 `simd_invoke!` 内执行：它是唯一建立 `#[target_feature(enable = "avx2,fma")]`
     // 的入口（B0 关键坑：泛型方法体直接调用 intrinsic 会退化为函数调用，实测 0.55× → 3.48×）。
     simd_invoke!(S, {
         let mut sl_arr = [0.0f32; MAX_LANES];
         let mut sr_arr = [0.0f32; MAX_LANES];
+        let mut filter = VecFilter::<S>::load(lanes, width);
 
-        macro_rules! load_lane_vec {
-            ($field:ident) => {{
-                let mut arr = [0.0f32; MAX_LANES];
-                for k in 0..width {
-                    arr[k] = lanes[k].$field;
-                }
-                S::Vf32::load_from_slice(&arr)
-            }};
+        // 采样热状态展平（每 chunk 一次）。
+        let mut hot_lanes = [HotLane::EMPTY; MAX_LANES];
+        for k in 0..width {
+            hot_lanes[k] = lanes[k].hot();
         }
-        macro_rules! store_lane_vec {
-            ($field:ident, $value:expr) => {{
-                let mut arr = [0.0f32; MAX_LANES];
-                $value.copy_to_slice(&mut arr);
-                for k in 0..width {
-                    lanes[k].$field = arr[k];
-                }
-            }};
-        }
-
-        // 滤波状态/系数装载到向量寄存器（每 chunk 一次，热循环内不再碰内存）。
-        let b0 = load_lane_vec!(b0);
-        let b1 = load_lane_vec!(b1);
-        let b2 = load_lane_vec!(b2);
-        let a1 = load_lane_vec!(a1);
-        let a2 = load_lane_vec!(a2);
-        let mut x1l = load_lane_vec!(x1l);
-        let mut x2l = load_lane_vec!(x2l);
-        let mut y1l = load_lane_vec!(y1l);
-        let mut y2l = load_lane_vec!(y2l);
-        let mut x1r = load_lane_vec!(x1r);
-        let mut x2r = load_lane_vec!(x2r);
-        let mut y1r = load_lane_vec!(y1r);
-        let mut y2r = load_lane_vec!(y2r);
 
         for step in 0..frames {
-            // 1) 标量：逐 lane 采样 + 包络 + 增益。
+            // 1) 标量：逐 lane 采样（+ 包络 + 增益，按消融档位）。
             unsafe {
                 for k in 0..width {
-                    let lane = lanes.get_unchecked_mut(k);
-                    let (l, r) = lane.next_pre_filter();
+                    let hot = hot_lanes.get_unchecked_mut(k);
+                    let (sl, sr) = if MODE == 4 {
+                        hot.sample_step_flat()
+                    } else {
+                        hot.sample_step()
+                    };
+                    let (l, r) = match MODE {
+                        0 | 4 => (sl, sr),
+                        1 => {
+                            let env = lanes.get_unchecked_mut(k).env.next_frame_simd::<S>();
+                            (sl * env, sr * env)
+                        }
+                        _ => {
+                            let env = lanes.get_unchecked_mut(k).env.next_frame_simd::<S>();
+                            (env * (hot.gain_l * sl), env * (hot.gain_r * sr))
+                        }
+                    };
                     *sl_arr.get_unchecked_mut(k) = l;
                     *sr_arr.get_unchecked_mut(k) = r;
                 }
             }
-            let mut sl = S::Vf32::load_from_slice(&sl_arr);
-            let mut sr = S::Vf32::load_from_slice(&sr_arr);
+            let sl = S::Vf32::load_from_slice(&sl_arr);
+            let sr = S::Vf32::load_from_slice(&sr_arr);
 
             // 2) 向量：biquad（lane = voice，时间维依赖链消失）。
-            if filter_on {
-                let ol = b0 * sl + b1 * x1l + b2 * x2l - a1 * y1l - a2 * y2l;
-                x2l = x1l;
-                x1l = sl;
-                y2l = y1l;
-                y1l = ol;
-                let or = b0 * sr + b1 * x1r + b2 * x2r - a1 * y1r - a2 * y2r;
-                x2r = x1r;
-                x1r = sr;
-                y2r = y1r;
-                y1r = or;
-                sl = ol;
-                sr = or;
-            }
+            let (sl, sr) = if MODE >= 3 {
+                filter.process(sl, sr)
+            } else {
+                (sl, sr)
+            };
 
             // 3) 混音：水平求和后一次写入共享通道缓冲。
             let lsum = sl.horizontal_add();
@@ -748,14 +1172,253 @@ fn render_inner<S: Simd>(lanes: &mut [&mut BatchLane], out: &mut [f32], frames: 
             }
         }
 
-        store_lane_vec!(x1l, x1l);
-        store_lane_vec!(x2l, x2l);
-        store_lane_vec!(y1l, y1l);
-        store_lane_vec!(y2l, y2l);
-        store_lane_vec!(x1r, x1r);
-        store_lane_vec!(x2r, x2r);
-        store_lane_vec!(y1r, y1r);
-        store_lane_vec!(y2r, y2r);
+        filter.store(lanes, width);
+        for k in 0..width {
+            lanes[k].apply_hot(&hot_lanes[k]);
+        }
+    });
+}
+
+/// 向量 biquad 状态（chunk 级；装载后热循环内不碰 lane 内存）。
+struct VecFilter<S: Simd> {
+    enabled: bool,
+    b0: S::Vf32,
+    b1: S::Vf32,
+    b2: S::Vf32,
+    a1: S::Vf32,
+    a2: S::Vf32,
+    x1l: S::Vf32,
+    x2l: S::Vf32,
+    y1l: S::Vf32,
+    y2l: S::Vf32,
+    x1r: S::Vf32,
+    x2r: S::Vf32,
+    y1r: S::Vf32,
+    y2r: S::Vf32,
+}
+
+impl<S: Simd> VecFilter<S> {
+    #[inline(always)]
+    fn load(lanes: &[&mut BatchLane], width: usize) -> VecFilter<S> {
+        simd_invoke!(S, {
+            macro_rules! lv {
+                ($field:ident) => {{
+                    let mut arr = [0.0f32; MAX_LANES];
+                    for k in 0..width {
+                        arr[k] = lanes[k].$field;
+                    }
+                    S::Vf32::load_from_slice(&arr)
+                }};
+            }
+            VecFilter {
+                enabled: lanes[0].filter_enabled,
+                b0: lv!(b0),
+                b1: lv!(b1),
+                b2: lv!(b2),
+                a1: lv!(a1),
+                a2: lv!(a2),
+                x1l: lv!(x1l),
+                x2l: lv!(x2l),
+                y1l: lv!(y1l),
+                y2l: lv!(y2l),
+                x1r: lv!(x1r),
+                x2r: lv!(x2r),
+                y1r: lv!(y1r),
+                y2r: lv!(y2r),
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn store(&self, lanes: &mut [&mut BatchLane], width: usize) {
+        simd_invoke!(S, {
+            macro_rules! sv {
+                ($field:ident, $value:expr) => {{
+                    let mut arr = [0.0f32; MAX_LANES];
+                    $value.copy_to_slice(&mut arr);
+                    for k in 0..width {
+                        lanes[k].$field = arr[k];
+                    }
+                }};
+            }
+            sv!(x1l, self.x1l);
+            sv!(x2l, self.x2l);
+            sv!(y1l, self.y1l);
+            sv!(y2l, self.y2l);
+            sv!(x1r, self.x1r);
+            sv!(x2r, self.x2r);
+            sv!(y1r, self.y1r);
+            sv!(y2r, self.y2r);
+        });
+    }
+
+    /// DF1，与 `BiQuadFilter::process` 逐项一致（无滤波器时原样返回，避免 -0.0 变号）。
+    #[inline(always)]
+    fn process(&mut self, sl: S::Vf32, sr: S::Vf32) -> (S::Vf32, S::Vf32) {
+        if !self.enabled {
+            return (sl, sr);
+        }
+        let ol = self.b0 * sl + self.b1 * self.x1l + self.b2 * self.x2l
+            - self.a1 * self.y1l
+            - self.a2 * self.y2l;
+        self.x2l = self.x1l;
+        self.x1l = sl;
+        self.y2l = self.y1l;
+        self.y1l = ol;
+
+        let or = self.b0 * sr + self.b1 * self.x1r + self.b2 * self.x2r
+            - self.a1 * self.y1r
+            - self.a2 * self.y2r;
+        self.x2r = self.x1r;
+        self.x1r = sr;
+        self.y2r = self.y1r;
+        self.y1r = or;
+
+        (ol, or)
+    }
+}
+
+/// 统一 chunk 判定：所有 lane 的循环模式 / 插值器 / 释放状态一致，且循环模式
+/// 可证明无越界（`in_range`）→ 可走无逐 lane 分支的专用内核。
+fn uniform_chunk(lanes: &[&mut BatchLane]) -> Option<(u8, bool, bool)> {
+    let first = lanes.first()?;
+    let linear = first.interpolator == Interpolator::Linear;
+    if !first.in_range_now(linear) {
+        return None;
+    }
+    let mode = first.hot_mode();
+    let released = first.released_sustain();
+    for lane in lanes.iter().skip(1) {
+        if lane.hot_mode() != mode
+            || (lane.interpolator == Interpolator::Linear) != linear
+            || lane.released_sustain() != released
+            || !lane.in_range_now(linear)
+        {
+            return None;
+        }
+    }
+    Some((mode, linear, released))
+}
+
+/// 统一 chunk 专用内核：循环模式/插值器/释放状态由 const 泛型给定，热循环内
+/// **没有**逐 lane 的模式/插值/释放分支与 `in_range` 检查（B1.3 调优主要收益）。
+///
+/// 与通用内核逐位等价：位置计算、回绕、`last` 更新语义完全一致（见 `HotLane`）。
+fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASED: bool>(
+    lanes: &mut [&mut BatchLane],
+    out: &mut [f32],
+    frames: usize,
+) {
+    let width = S::Vf32::WIDTH;
+    debug_assert_eq!(lanes.len(), width);
+    /// 循环模式且未释放 → `uniform_chunk` 已证明回绕后位置必然在缓冲内。
+    const fn in_range_const<const MODE_TAG: u8, const RELEASED: bool>() -> bool {
+        !RELEASED && MODE_TAG != HOT_MODE_NOLOOP
+    }
+    simd_invoke!(S, {
+        let mut sl_arr = [0.0f32; MAX_LANES];
+        let mut sr_arr = [0.0f32; MAX_LANES];
+        let mut filter = VecFilter::<S>::load(lanes, width);
+
+        let mut hot_lanes = [HotLane::EMPTY; MAX_LANES];
+        for k in 0..width {
+            hot_lanes[k] = lanes[k].hot();
+        }
+
+        // `last` 只在 chunk 边界被读取（`is_past_end` / 释放后外推），但需要每帧
+        // 的未回绕位置，因此按帧写入热状态（无读取）。
+        let track_last = MODE_TAG == HOT_MODE_SUSTAIN && !RELEASED;
+
+        macro_rules! load_sample {
+            ($hot:expr, $pos:expr, $ptr:expr, $len:expr) => {{
+                if in_range_const::<MODE_TAG, RELEASED>() {
+                    // SAFETY: 见 `in_range_const`（回绕后位置 + 线性余量 ≤ 缓冲长度）。
+                    unsafe { *$ptr.add($pos) }
+                } else {
+                    $hot.load($pos, $ptr, $len)
+                }
+            }};
+        }
+
+        for step in 0..frames {
+            unsafe {
+                for k in 0..width {
+                    let hot = hot_lanes.get_unchecked_mut(k);
+                    let t = hot.time;
+                    hot.time = t + hot.speed as f64;
+                    let index = t as i32;
+                    let base_l = index as usize + hot.off_l;
+                    let base_r = index as usize + hot.off_r;
+
+                    if track_last {
+                        // `SampleReaderLoopSustain::get` 每次读取都更新 `last`
+                        // （未回绕位置；线性插值连读 index/index+1 → 为 index+1）。
+                        hot.last_l = if LINEAR { base_l + 1 } else { base_l };
+                        hot.last_r = if LINEAR { base_r + 1 } else { base_r };
+                    }
+
+                    let (pos_l, pos_r, pos_l1, pos_r1) = if RELEASED {
+                        let f = |base: usize, last: usize, end: usize| {
+                            base.wrapping_sub(last).wrapping_add(end)
+                        };
+                        (
+                            f(base_l, hot.last_l, hot.end_l),
+                            f(base_r, hot.last_r, hot.end_r),
+                            f(base_l + 1, hot.last_l, hot.end_l),
+                            f(base_r + 1, hot.last_r, hot.end_r),
+                        )
+                    } else if MODE_TAG == HOT_MODE_NOLOOP {
+                        (base_l, base_r, base_l + 1, base_r + 1)
+                    } else {
+                        let w = |base: usize, end: usize| {
+                            if base > end {
+                                wrap_pos(base, hot.start, end)
+                            } else {
+                                base
+                            }
+                        };
+                        (
+                            w(base_l, hot.end_l),
+                            w(base_r, hot.end_r),
+                            w(base_l + 1, hot.end_l),
+                            w(base_r + 1, hot.end_r),
+                        )
+                    };
+
+                    let (sl, sr) = if LINEAR {
+                        let frac = (t - index as f64) as f32;
+                        let l0 = load_sample!(hot, pos_l, hot.ptr_l, hot.len_l);
+                        let l1 = load_sample!(hot, pos_l1, hot.ptr_l, hot.len_l);
+                        let r0 = load_sample!(hot, pos_r, hot.ptr_r, hot.len_r);
+                        let r1 = load_sample!(hot, pos_r1, hot.ptr_r, hot.len_r);
+                        (l0 * (1.0 - frac) + l1 * frac, r0 * (1.0 - frac) + r1 * frac)
+                    } else {
+                        (
+                            load_sample!(hot, pos_l, hot.ptr_l, hot.len_l),
+                            load_sample!(hot, pos_r, hot.ptr_r, hot.len_r),
+                        )
+                    };
+
+                    let env = lanes.get_unchecked_mut(k).env.next_frame_simd::<S>();
+                    *sl_arr.get_unchecked_mut(k) = env * (hot.gain_l * sl);
+                    *sr_arr.get_unchecked_mut(k) = env * (hot.gain_r * sr);
+                }
+            }
+            let sl = S::Vf32::load_from_slice(&sl_arr);
+            let sr = S::Vf32::load_from_slice(&sr_arr);
+            let (sl, sr) = filter.process(sl, sr);
+            let lsum = sl.horizontal_add();
+            let rsum = sr.horizontal_add();
+            unsafe {
+                *out.get_unchecked_mut(2 * step) += lsum;
+                *out.get_unchecked_mut(2 * step + 1) += rsum;
+            }
+        }
+
+        filter.store(lanes, width);
+        for k in 0..width {
+            lanes[k].apply_hot(&hot_lanes[k]);
+        }
     });
 }
 

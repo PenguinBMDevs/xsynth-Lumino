@@ -12,8 +12,10 @@ pub(crate) use simdvoice::*;
 
 pub mod batch;
 pub use batch::BatchLane;
+#[allow(unused_imports)]
 pub(crate) use batch::{
     BatchLaneInit, StereoBatchVoice, batch_chunk_width, batching_supported, render_batch_chunk,
+    render_batch_chunk_mode,
 };
 
 #[cfg(test)]

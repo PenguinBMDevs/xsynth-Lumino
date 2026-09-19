@@ -323,7 +323,9 @@ mod tests {
 
     use super::*;
     use crate::soundfont::{EnvelopeCurveType, EnvelopeDescriptor, EnvelopeOptions};
-    use crate::voice::{render_batch_chunk, BatchLane, ReleaseType, Voice};
+    use crate::voice::{
+        render_batch_chunk, render_batch_chunk_mode, BatchLane, ReleaseType, Voice,
+    };
 
     const SR: u32 = 48_000;
     const FRAMES: usize = 480;
@@ -347,6 +349,20 @@ mod tests {
             hold: 0.006,
             decay: 0.03,
             sustain_percent: 0.35,
+            release: 0.05,
+        }
+    }
+
+    /// 长 Decay 包络：整个测量期间停留在 Decay（`LerpConcave`，标量路径最贵），
+    /// 贴近真实钢琴长衰减声部的稳态负载。
+    fn long_descriptor() -> EnvelopeDescriptor {
+        EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.0,
+            attack: 0.001,
+            hold: 0.0,
+            decay: 1_000.0,
+            sustain_percent: 0.5,
             release: 0.05,
         }
     }
@@ -419,8 +435,12 @@ mod tests {
     }
 
     /// 口径 1：标量 lane ≡ 真实链式生成器（逐位），覆盖
-    /// 4 loop mode × 2 interpolator × 2 filter × 2 曲线组合 × 12 块，
+    /// 4 loop mode × 2 interpolator × 2 filter × 2 曲线组合 × 14 块，
     /// 中途注入控制消息（pitch/attack/release）与 release/kill。
+    ///
+    /// 关键：包络用**长 Decay**（`long_descriptor`），保证采样位置跨越 loop 边界
+    /// （`loop_end` 之后）时包络仍非零——否则 `env == 0` 会掩盖采样位置错误
+    /// （历史上 NoLoop 不回绕语义的正确性正是被这一点掩盖过）。
     #[test]
     fn batch_lane_matches_real_chain_bitwise() {
         simd_runtime_generate!(
@@ -428,7 +448,9 @@ mod tests {
                 for (mode, interpolator, filter) in all_cases() {
                     for options in envelope_option_sets() {
                         for kill in [false, true] {
-                            let s = spawner::<S>(mode, interpolator, filter, options, 0.4, 100);
+                            let mut s = spawner::<S>(mode, interpolator, filter, options, 0.4, 100);
+                            s.volume_envelope_params =
+                                Arc::new(long_descriptor().to_envelope_params(SR, options));
                             let control = VoiceControlData::new_defaults();
                             let mut real = s.begin_voice_impl(&control, false, false);
                             let mut batch = s.begin_voice_impl(&control, true, false);
@@ -444,16 +466,16 @@ mod tests {
 
                             let mut real_buf = vec![0.0f32; FRAMES * 2];
                             let mut batch_buf = vec![0.0f32; FRAMES * 2];
-                            for block in 0..12 {
+                            for block in 0..14 {
                                 if block == 2 {
                                     real.process_controls(&ctl);
                                     batch.process_controls(&ctl);
                                 }
-                                if block == 4 {
+                                if block == 9 {
                                     real.signal_release(ReleaseType::Standard);
                                     batch.signal_release(ReleaseType::Standard);
                                 }
-                                if block == 7 && kill {
+                                if block == 12 && kill {
                                     real.signal_release(ReleaseType::Kill);
                                     batch.signal_release(ReleaseType::Kill);
                                 }
@@ -475,8 +497,9 @@ mod tests {
                                 );
                             }
 
-                            // 结束后仍应保持同步：OneShot 且未 Kill 时 `allow_release == false`，
-                            // 包络不会进入 Release（两路径一致地不结束）；其余组合应已 Finished。
+                            // 结束后仍应保持同步：OneShot 时 `allow_release == false` 且
+                            // 缓冲足够长（未越界结束），包络不会进入 Release（两路径一致地
+                            // 不结束）；其余组合应已 Finished。
                             if kill || mode != LoopMode::OneShot {
                                 assert!(real.ended() && batch.ended());
                             }
@@ -492,95 +515,145 @@ mod tests {
     /// 口径 2：批内核 ≡ 标量 lane（逐位）。
     ///
     /// 活跃 lane 放在中间下标（验证任意 lane 位置），其余 lane 全部静音（`amp = 0`
-    /// → 增益为 0 → 经 biquad 后为 +0.0），因此水平求和 = 活跃 lane 的值，
-    /// 与逐 voice 顺序累加逐位等价。静音 lane 使用不同的 loop mode / 插值器，
-    /// 顺带覆盖内核内的异构分支。
+    /// → 增益为 0 → 经 biquad 后为 +0.0），因此水平求和 = 活跃 lane 的值。
+    ///
+    /// 覆盖全部 (loop mode × interpolator) 组合，且包络用**长 Decay**：采样位置会
+    /// 越过 `loop_end`（3000）后才比较，专门锁死 NoLoop「不回绕」与 Loop「回绕」的
+    /// 语义差异（历史盲区：静音 lane 的样本被 0 增益掩盖，导致该差异逃脱测试）。
     #[test]
     fn batch_kernel_matches_scalar_lane_bitwise() {
         simd_runtime_generate!(
             fn run() {
                 let width = S::Vf32::WIDTH;
                 let active_idx = (width / 2).min(width - 1);
+
+                for (mode, interpolator) in [
+                    (LoopMode::LoopSustain, Interpolator::Nearest),
+                    (LoopMode::LoopSustain, Interpolator::Linear),
+                    (LoopMode::LoopContinuous, Interpolator::Nearest),
+                    (LoopMode::LoopContinuous, Interpolator::Linear),
+                    (LoopMode::NoLoop, Interpolator::Nearest),
+                    (LoopMode::NoLoop, Interpolator::Linear),
+                    (LoopMode::OneShot, Interpolator::Nearest),
+                    (LoopMode::OneShot, Interpolator::Linear),
+                ] {
+                    let options = EnvelopeOptions::default();
+                    let mut active_spawner =
+                        spawner::<S>(mode, interpolator, true, options, 0.4, 100);
+                    active_spawner.volume_envelope_params =
+                        Arc::new(long_descriptor().to_envelope_params(SR, options));
+                    let mut silent_spawner =
+                        spawner::<S>(mode, interpolator, true, options, 0.0, 100);
+                    silent_spawner.volume_envelope_params =
+                        Arc::new(long_descriptor().to_envelope_params(SR, options));
+
+                    let control = VoiceControlData::new_defaults();
+                    let mut voices: Vec<Box<dyn Voice>> = (0..width)
+                        .map(|k| {
+                            if k == active_idx {
+                                active_spawner.begin_voice_impl(&control, true, false)
+                            } else {
+                                silent_spawner.begin_voice_impl(&control, true, false)
+                            }
+                        })
+                        .collect();
+                    // 参考 voice：同一参数、独立状态、只走标量 lane 渲染（`read_side` 语义）。
+                    let mut reference = active_spawner.begin_voice_impl(&control, true, false);
+
+                    let mut kernel_buf = vec![0.0f32; FRAMES * 2];
+                    let mut scalar_buf = vec![0.0f32; FRAMES * 2];
+                    for block in 0..16 {
+                        kernel_buf.fill(0.0);
+                        scalar_buf.fill(0.0);
+
+                        let mut lanes: Vec<&mut BatchLane> =
+                            voices.iter_mut().filter_map(|v| v.batch_lane()).collect();
+                        assert_eq!(lanes.len(), width);
+                        assert!(render_batch_chunk(&mut lanes, &mut kernel_buf, FRAMES));
+                        drop(lanes);
+
+                        reference
+                            .batch_lane()
+                            .expect("参考 voice 应为批 voice")
+                            .render_scalar(&mut scalar_buf);
+
+                        assert_eq!(
+                            kernel_buf, scalar_buf,
+                            "第 {block} 块内核与标量 lane 不一致: {mode:?} {interpolator:?}"
+                        );
+                    }
+                }
+            }
+        );
+
+        run();
+    }
+
+    /// 口径 2b：统一 chunk 专用内核 ≡ 通用内核（逐位）。
+    ///
+    /// 通用内核已由口径 1/2 验证与标量参考逐位一致；本测试专门覆盖 B1.3 引入的
+    /// 无逐 lane 分支专用内核（模式/插值/释放状态 const 泛型化）各组合的等价性。
+    #[test]
+    fn batch_uniform_kernel_matches_generic_kernel_bitwise() {
+        simd_runtime_generate!(
+            fn run() {
+                let width = S::Vf32::WIDTH;
                 let options = EnvelopeOptions::default();
+                for (mode, interpolator) in [
+                    (LoopMode::LoopSustain, Interpolator::Nearest),
+                    (LoopMode::LoopSustain, Interpolator::Linear),
+                    (LoopMode::LoopContinuous, Interpolator::Nearest),
+                    (LoopMode::LoopContinuous, Interpolator::Linear),
+                    (LoopMode::NoLoop, Interpolator::Linear),
+                    (LoopMode::OneShot, Interpolator::Nearest),
+                ] {
+                    let s = spawner::<S>(mode, interpolator, true, options, 0.4, 100);
+                    let control = VoiceControlData::new_defaults();
+                    let mut uniform_voices: Vec<Box<dyn Voice>> = (0..width)
+                        .map(|_| s.begin_voice_impl(&control, true, false))
+                        .collect();
+                    let mut generic_voices: Vec<Box<dyn Voice>> = (0..width)
+                        .map(|_| s.begin_voice_impl(&control, true, false))
+                        .collect();
 
-                let active_spawner = spawner::<S>(
-                    LoopMode::LoopSustain,
-                    Interpolator::Linear,
-                    true,
-                    options,
-                    0.4,
-                    100,
-                );
-                let silent_spawners = [
-                    spawner::<S>(
-                        LoopMode::LoopSustain,
-                        Interpolator::Nearest,
-                        true,
-                        options,
-                        0.0,
-                        100,
-                    ),
-                    spawner::<S>(
-                        LoopMode::LoopContinuous,
-                        Interpolator::Linear,
-                        true,
-                        options,
-                        0.0,
-                        80,
-                    ),
-                    spawner::<S>(
-                        LoopMode::NoLoop,
-                        Interpolator::Linear,
-                        true,
-                        options,
-                        0.0,
-                        60,
-                    ),
-                    spawner::<S>(
-                        LoopMode::OneShot,
-                        Interpolator::Nearest,
-                        true,
-                        options,
-                        0.0,
-                        40,
-                    ),
-                ];
-
-                let control = VoiceControlData::new_defaults();
-                let mut voices: Vec<Box<dyn Voice>> = (0..width)
-                    .map(|k| {
-                        if k == active_idx {
-                            active_spawner.begin_voice_impl(&control, true, false)
-                        } else {
-                            silent_spawners[k % silent_spawners.len()]
-                                .begin_voice_impl(&control, true, false)
+                    let mut uniform_buf = vec![0.0f32; FRAMES * 2];
+                    let mut generic_buf = vec![0.0f32; FRAMES * 2];
+                    for block in 0..14 {
+                        uniform_buf.fill(0.0);
+                        generic_buf.fill(0.0);
+                        // 第 6 块统一释放（覆盖 LoopSustain 的释放后分支）。
+                        if block == 6 {
+                            for voice in uniform_voices.iter_mut() {
+                                voice.signal_release(ReleaseType::Standard);
+                            }
+                            for voice in generic_voices.iter_mut() {
+                                voice.signal_release(ReleaseType::Standard);
+                            }
                         }
-                    })
-                    .collect();
-                // 参考 voice：同一参数、独立状态、只走标量 lane 渲染。
-                let mut reference = active_spawner.begin_voice_impl(&control, true, false);
+                        let mut lanes: Vec<&mut BatchLane> = uniform_voices
+                            .iter_mut()
+                            .filter_map(|v| v.batch_lane())
+                            .collect();
+                        assert!(render_batch_chunk(&mut lanes, &mut uniform_buf, FRAMES));
+                        drop(lanes);
 
-                let mut kernel_buf = vec![0.0f32; FRAMES * 2];
-                let mut scalar_buf = vec![0.0f32; FRAMES * 2];
-                for block in 0..10 {
-                    kernel_buf.fill(0.0);
-                    scalar_buf.fill(0.0);
+                        let mut lanes: Vec<&mut BatchLane> = generic_voices
+                            .iter_mut()
+                            .filter_map(|v| v.batch_lane())
+                            .collect();
+                        assert!(render_batch_chunk_mode(
+                            &mut lanes,
+                            &mut generic_buf,
+                            FRAMES,
+                            3
+                        ));
+                        drop(lanes);
 
-                    let mut lanes: Vec<&mut BatchLane> =
-                        voices.iter_mut().filter_map(|v| v.batch_lane()).collect();
-                    assert_eq!(lanes.len(), width);
-                    assert!(render_batch_chunk(&mut lanes, &mut kernel_buf, FRAMES));
-                    drop(lanes);
-
-                    reference
-                        .batch_lane()
-                        .expect("参考 voice 应为批 voice")
-                        .render_scalar(&mut scalar_buf);
-
-                    assert_eq!(
-                        kernel_buf, scalar_buf,
-                        "第 {block} 块内核与标量 lane 不一致（活跃下标 {active_idx}，宽度 {width}）"
-                    );
+                        assert_eq!(
+                            uniform_buf, generic_buf,
+                            "第 {block} 块统一内核与通用内核不一致: {mode:?} {interpolator:?}"
+                        );
+                    }
                 }
             }
         );
@@ -651,6 +724,148 @@ mod tests {
                     assert!(
                         (rms_kernel - rms_scalar).abs() <= 1e-9 + 1e-6 * rms_scalar,
                         "第 {block} 块 RMS 偏离: kernel={rms_kernel} scalar={rms_scalar}"
+                    );
+                }
+            }
+        );
+
+        run();
+    }
+
+    /// B1 内核 vs 真实链路（同参数、同长度、min-of-N 交错）——真实 lane 实现的
+    /// 单 voice 成本，用于判断批处理收益是否被标量部分（采样/包络）吃掉。
+    ///
+    /// 手动运行：
+    /// `cargo test --release -p xsynth-core --lib batch_kernel_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "性能基准，手动运行"]
+    fn batch_kernel_speed_vs_real_chain() {
+        use std::time::Instant;
+
+        simd_runtime_generate!(
+            fn run() {
+                let width = S::Vf32::WIDTH;
+                if width < 8 {
+                    println!("[B1] 跳过：运行时 SIMD 宽度 {width} < 8");
+                    return;
+                }
+                const ROUNDS: usize = 5;
+                const ITERS: usize = 200;
+
+                for (name, mode, interpolator, filter) in [
+                    (
+                        "loop_sustain+filter",
+                        LoopMode::LoopSustain,
+                        Interpolator::Nearest,
+                        true,
+                    ),
+                    (
+                        "loop_continuous+filter",
+                        LoopMode::LoopContinuous,
+                        Interpolator::Nearest,
+                        true,
+                    ),
+                    (
+                        "loop_sustain+nofilter",
+                        LoopMode::LoopSustain,
+                        Interpolator::Nearest,
+                        false,
+                    ),
+                    (
+                        "loop_sustain+filter+linear",
+                        LoopMode::LoopSustain,
+                        Interpolator::Linear,
+                        true,
+                    ),
+                ] {
+                    // 长 Decay：测量期间停在 LerpConcave 阶段（标量路径最贵）。
+                    let s = spawner::<S>(
+                        mode,
+                        interpolator,
+                        filter,
+                        EnvelopeOptions::default(),
+                        0.4,
+                        100,
+                    );
+                    // 用长衰减包络替换（spawner 字段为私有，测试内可直接重建）。
+                    let mut s = s;
+                    s.volume_envelope_params = Arc::new(
+                        long_descriptor().to_envelope_params(SR, EnvelopeOptions::default()),
+                    );
+                    let control = VoiceControlData::new_defaults();
+
+                    let mut chain: Vec<Box<dyn Voice>> = (0..width)
+                        .map(|_| s.begin_voice_impl(&control, false, false))
+                        .collect();
+                    let mut kernel: Vec<Box<dyn Voice>> = (0..width)
+                        .map(|_| s.begin_voice_impl(&control, true, false))
+                        .collect();
+                    if kernel[0].batch_lane().is_none() {
+                        println!("[B1] 跳过 {name}：批 voice 未构造成功");
+                        continue;
+                    }
+
+                    let mut chain_buf = vec![0.0f32; FRAMES * 2];
+                    let mut kernel_buf = vec![0.0f32; FRAMES * 2];
+                    let mut best_chain = f64::MAX;
+                    let mut best_modes = [f64::MAX; 6];
+                    macro_rules! bench_mode {
+                        ($mode:literal) => {{
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                kernel_buf.fill(0.0);
+                                let mut lanes: Vec<&mut BatchLane> =
+                                    kernel.iter_mut().filter_map(|v| v.batch_lane()).collect();
+                                assert!(render_batch_chunk_mode(
+                                    &mut lanes,
+                                    &mut kernel_buf,
+                                    FRAMES,
+                                    $mode
+                                ));
+                            }
+                            best_modes[$mode] =
+                                best_modes[$mode].min(t.elapsed().as_nanos() as f64 / ITERS as f64);
+                        }};
+                    }
+                    for _ in 0..ROUNDS {
+                        let t = Instant::now();
+                        for _ in 0..ITERS {
+                            chain_buf.fill(0.0);
+                            for voice in chain.iter_mut() {
+                                voice.render_to(&mut chain_buf);
+                            }
+                        }
+                        best_chain = best_chain.min(t.elapsed().as_nanos() as f64 / ITERS as f64);
+
+                        bench_mode!(0);
+                        bench_mode!(1);
+                        bench_mode!(2);
+                        bench_mode!(3);
+                        bench_mode!(4);
+                        // 生产入口（统一 chunk 走无逐 lane 分支的专用内核）
+                        {
+                            let t = Instant::now();
+                            for _ in 0..ITERS {
+                                kernel_buf.fill(0.0);
+                                let mut lanes: Vec<&mut BatchLane> =
+                                    kernel.iter_mut().filter_map(|v| v.batch_lane()).collect();
+                                assert!(render_batch_chunk(&mut lanes, &mut kernel_buf, FRAMES));
+                            }
+                            best_modes[5] =
+                                best_modes[5].min(t.elapsed().as_nanos() as f64 / ITERS as f64);
+                        }
+                    }
+
+                    println!(
+                        "[B1] {name}: chain={:.0} mode0(sample)={:.0} mode1(+env)={:.0} mode2(+gain)={:.0} mode3(generic)={:.0} mode4(flat)={:.0} prod(uniform)={:.0} ns/voice-block; speedup={:.2}x",
+                        best_chain / width as f64,
+                        best_modes[0] / width as f64,
+                        best_modes[1] / width as f64,
+                        best_modes[2] / width as f64,
+                        best_modes[3] / width as f64,
+                        best_modes[4] / width as f64,
+                        best_modes[5] / width as f64,
+                        best_chain / best_modes[5]
                     );
                 }
             }

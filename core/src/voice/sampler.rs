@@ -45,6 +45,14 @@ pub trait SIMDSampleGrabber<S: Simd>: Send + Sync {
 
 pub struct F32BufferSampler(Arc<[f32]>);
 
+impl F32BufferSampler {
+    /// B1 批处理：底层切片（见 `BufferSamplers::slice`）。
+    #[inline(always)]
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+}
+
 impl BufferSampler for F32BufferSampler {
     #[inline(always)]
     fn get(&self, pos: usize) -> f32 {
@@ -69,6 +77,15 @@ impl BufferSamplers {
     #[inline(always)]
     pub fn new_f32(sample: Arc<[f32]>) -> BufferSamplers {
         BufferSamplers::F32(F32BufferSampler(sample))
+    }
+
+    /// B1 批处理：取出底层样本缓冲切片（lane 在 chunk 开始时裁剪一次，
+    /// 热循环内不再做枚举匹配 / Arc 间接）。
+    #[inline(always)]
+    pub(crate) fn slice(&self) -> &[f32] {
+        match self {
+            BufferSamplers::F32(sampler) => sampler.as_slice(),
+        }
     }
 }
 
