@@ -89,6 +89,54 @@ mod mix_probe {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod reg_probe {
+    use std::arch::x86_64::*;
+    use std::hint::black_box;
+
+    /// gather：索引驻留寄存器（与生产一致），每轮 2 次 gather。
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn time_gather_reg(buf: &[f32], idx0: __m256i, reps: usize) -> f64 {
+        let base = buf.as_ptr();
+        let one = _mm256_set1_epi32(1);
+        let mask = _mm256_set1_epi32(1023);
+        let mut idx = idx0;
+        let t0 = std::time::Instant::now();
+        let mut acc = _mm256_setzero_ps();
+        for _ in 0..reps {
+            let next = _mm256_add_epi32(idx, one);
+            let a = _mm256_i32gather_ps::<4>(base, idx);
+            let b = _mm256_i32gather_ps::<4>(base, next);
+            acc = _mm256_add_ps(acc, _mm256_add_ps(a, b));
+            idx = _mm256_and_si256(_mm256_add_epi32(idx, one), mask);
+        }
+        let mut out = [0.0f32; 8];
+        _mm256_storeu_ps(out.as_mut_ptr(), acc);
+        black_box(out);
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// 标量：索引驻留栈/寄存器，每轮 16 次加载（公平对照）。
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn time_scalar_reg(buf: &[f32], idx0: __m256i, reps: usize) -> f64 {
+        let mut arr = [0i32; 8];
+        _mm256_storeu_si256(arr.as_mut_ptr() as *mut __m256i, idx0);
+        let t0 = std::time::Instant::now();
+        let mut acc = 0.0f32;
+        for i in 0..reps {
+            let bump = (i & 1) as i32;
+            let mut s = 0.0f32;
+            for k in 0..8 {
+                let p = ((*arr.get_unchecked(k) + bump) as usize) & 1023;
+                s += *buf.get_unchecked(p) + *buf.get_unchecked(p + 1);
+            }
+            acc += s;
+        }
+        black_box(acc);
+        t0.elapsed().as_secs_f64()
+    }
+}
+
 fn time_mix_scalar(l: &[f32; 8], r: &[f32; 8], reps: usize) -> f64 {
     let mut out = vec![0.0f32; 16];
     let t0 = Instant::now();
@@ -207,5 +255,20 @@ fn main() {
             );
         }
         None => println!("mix/8帧: scalar={ms:5.2} ns  unpack=N/A"),
+    }
+
+    // 公平对照：索引驻留寄存器（与生产路径一致），标量 16 次加载 vs 2 次 gather。
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        use std::arch::x86_64::*;
+        let small: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.01).sin()).collect();
+        let idx = unsafe { _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7) };
+        let reps = 20_000_000usize;
+        let s = unsafe { reg_probe::time_scalar_reg(&small, idx, reps) } / reps as f64 * 1e9;
+        let g = unsafe { reg_probe::time_gather_reg(&small, idx, reps) } / reps as f64 * 1e9;
+        println!(
+            "reg-index/8帧: scalar={s:5.2} ns  gather={g:5.2} ns  speedup={:.2}x",
+            s / g
+        );
     }
 }
