@@ -15,10 +15,23 @@ use crate::AudioStreamParams;
 
 use super::AudioPipe;
 
+/// 目标缓冲余量（交织 f32 计数）。
+///
+/// `cushion_samples` 与 `render_size` 的单位都是「帧」，而渲染线程的缓冲计数器
+/// `samples` 按**交织 f32** 累计（帧 × 声道数）。两者量纲必须在这里对齐，
+/// 否则配置的缓冲目标会按声道数缩水（立体声下 100ms 只剩 50ms），
+/// 单次渲染尖峰即可把缓冲抽干造成 underrun。
+fn cushion_target_interleaved(
+    cushion_frames: usize,
+    render_size_frames: usize,
+    channel_count: usize,
+) -> i64 {
+    (cushion_frames.max(render_size_frames) * channel_count) as i64
+}
+
 /// Holds the statistics for an instance of BufferedRenderer.
 #[derive(Debug, Clone)]
-struct BufferedRendererStats {
-    samples: Arc<AtomicI64>,
+struct BufferedRendererStats {    samples: Arc<AtomicI64>,
 
     last_samples_after_read: Arc<AtomicI64>,
 
@@ -107,8 +120,8 @@ impl BufferedRenderer {
     /// - `render`: An object implementing the AudioPipe struct for BufferedRenderer to
     ///   read samples from
     /// - `stream_params`: Parameters of the output audio
-    /// - `render_size`: The number of samples to render each iteration
-    /// - `cushion_samples`: Target number of rendered-but-unconsumed samples
+    /// - `render_size`: The number of frames to render each iteration
+    /// - `cushion_samples`: Target number of rendered-but-unconsumed **frames**
     ///   to keep buffered (clamped to at least one `render_size`). The render
     ///   thread keeps rendering until this cushion is reached, then paces at
     ///   ~90% of realtime.
@@ -152,10 +165,17 @@ impl BufferedRenderer {
                     // which stutters even at low average render loads. The
                     // cushion is decoupled from the block size so small blocks
                     // (tight event timing) can still have a deep buffer.
+                    //
+                    // 量纲对齐：`samples` 为交织 f32 计数，目标同样换算成交织计数
+                    // （见 `cushion_target_interleaved`）。
+                    let cushion_target = cushion_target_interleaved(
+                        cushion_samples,
+                        size,
+                        stream_params.channels.count() as usize,
+                    );
                     loop {
                         let samples = samples.load(Ordering::SeqCst);
-                        let target = cushion_samples.max(size) as i64;
-                        if samples > target {
+                        if samples > cushion_target {
                             spin_sleep::sleep(delay / 10);
                         } else {
                             break;
@@ -310,7 +330,7 @@ mod tests {
         },
     };
 
-    use super::{BufferedRendererStats, BufferedRendererStatsReader};
+    use super::{BufferedRendererStats, BufferedRendererStatsReader, cushion_target_interleaved};
 
     #[test]
     fn average_renderer_load_is_zero_when_no_samples_have_been_rendered() {
@@ -326,5 +346,15 @@ mod tests {
 
         assert_eq!(reader.average_renderer_load(), 0.0);
         assert_eq!(reader.last_renderer_load(), 0.0);
+    }
+
+    #[test]
+    fn cushion_target_matches_interleaved_counter_units() {
+        // 立体声、100ms 目标（4800 帧）、10ms 块（480 帧）→ 交织计数 9600
+        assert_eq!(cushion_target_interleaved(4800, 480, 2), 9600);
+        // 目标小于块长时以块长为下限（再换算成交织计数）
+        assert_eq!(cushion_target_interleaved(100, 480, 2), 960);
+        // 单声道：帧 == 交织计数
+        assert_eq!(cushion_target_interleaved(4800, 480, 1), 4800);
     }
 }

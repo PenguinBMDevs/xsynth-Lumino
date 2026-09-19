@@ -157,7 +157,11 @@ impl<Sampler: BufferSampler> SampleReader for SampleReaderLoop<Sampler> {
         let start = self.loop_start;
 
         if pos > end {
-            pos = (pos - end - 1) % (end - start) + start;
+            // 循环回绕：常见情况只越界少量样本，用比较 + 减法避免整数除法；
+            // 极端越界（跨多个循环周期）回退取模，语义与原实现一致。
+            let span = end - start;
+            let d = pos - end - 1;
+            pos = start + if d >= span { d % span } else { d };
         }
 
         self.buffer.get(pos)
@@ -208,7 +212,10 @@ impl<Sampler: BufferSampler> SampleReader for SampleReaderLoopSustain<Sampler> {
         if !self.is_released {
             self.last = pos;
             if pos > end {
-                pos = (pos - end - 1) % (end - start) + start;
+                // 同 SampleReaderLoop：常见越界走比较 + 减法，极端越界回退取模。
+                let span = end - start;
+                let d = pos - end - 1;
+                pos = start + if d >= span { d % span } else { d };
             }
         } else {
             pos = pos - self.last + self.loop_end;
@@ -352,8 +359,11 @@ where
             unsafe {
                 for i in 0..S::Vf32::WIDTH {
                     let time = self.increment_time(speed.get_unchecked(i) as f64);
-                    *indexes.get_unchecked_mut(i) = time as i32;
-                    *fractionals.get_unchecked_mut(i) = (time % 1.0) as f32;
+                    // `time % 1.0` 会为每个样本触发 fmod 库调用；改用「截断整数 + 差值」：
+                    // 对 0 ≤ time < 2^31 与 fmod 结果逐位等价（两者都是精确运算）。
+                    let index = time as i32;
+                    *indexes.get_unchecked_mut(i) = index;
+                    *fractionals.get_unchecked_mut(i) = (time - index as f64) as f32;
                 }
             }
 
@@ -377,6 +387,9 @@ where
 
     time: f64,
 
+    /// 性能探针采样标记（仅 `voice_probe` feature 且命中采样步长时为 true）。
+    probe: bool,
+
     _s: PhantomData<S>,
 }
 
@@ -386,12 +399,13 @@ where
     Pitch: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
     Grabber: SIMDSampleGrabber<S>,
 {
-    pub fn new(grabber_left: Grabber, grabber_right: Grabber, pitch_gen: Pitch) -> Self {
+    pub fn new(grabber_left: Grabber, grabber_right: Grabber, pitch_gen: Pitch, probe: bool) -> Self {
         SIMDStereoVoiceSampler {
             grabber_left,
             grabber_right,
             pitch_gen,
             time: 0.0,
+            probe,
             _s: PhantomData,
         }
     }
@@ -437,22 +451,52 @@ where
     #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleStereo<S> {
         simd_invoke!(S, {
+            // 性能探针：仅被采样的 voice 走计时路径（pitch → 时间推进 → 采样抓取）。
+            let mut marks = crate::voice_probe::sampler_begin(self.probe);
+
             let speed = self.pitch_gen.next_sample().0;
+            crate::voice_probe::sampler_mark(&mut marks, 1);
             let mut indexes = S::Vi32::zeroes();
             let mut fractionals = S::Vf32::zeroes();
 
             unsafe {
                 for i in 0..S::Vf32::WIDTH {
                     let time = self.increment_time(speed.get_unchecked(i) as f64);
-                    *indexes.get_unchecked_mut(i) = time as i32;
-                    *fractionals.get_unchecked_mut(i) = (time % 1.0) as f32;
+                    // `time % 1.0` 会为每个样本触发 fmod 库调用；改用「截断整数 + 差值」：
+                    // 对 0 ≤ time < 2^31 与 fmod 结果逐位等价（两者都是精确运算）。
+                    let index = time as i32;
+                    *indexes.get_unchecked_mut(i) = index;
+                    *fractionals.get_unchecked_mut(i) = (time - index as f64) as f32;
                 }
             }
 
+            crate::voice_probe::sampler_mark(&mut marks, 2);
             let left = self.grabber_left.get(indexes, fractionals);
             let right = self.grabber_right.get(indexes, fractionals);
+            crate::voice_probe::sampler_end(&mut marks, S::Vf32::WIDTH);
 
             SIMDSampleStereo(left, right)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 优化前后行为一致性：`time % 1.0` 与「截断 + 差值」在非负时间上逐位等价。
+    #[test]
+    fn fraction_optimization_matches_fmod() {
+        let mut t = 0.0f64;
+        let mut step = 0.123_456_789f64;
+        let mut checks = 0u32;
+        while t < 200_000.0 {
+            let index = t as i32;
+            let fast = (t - index as f64) as f32;
+            let slow = (t % 1.0) as f32;
+            assert_eq!(fast, slow, "t={t}");
+            t += step;
+            step = 0.1 + (step * 1.618_033_9) % 1.0;
+            checks += 1;
+        }
+        assert!(checks > 100_000, "采样点太少: {checks}");
     }
 }

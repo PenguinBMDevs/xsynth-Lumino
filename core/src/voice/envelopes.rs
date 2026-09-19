@@ -268,6 +268,9 @@ pub struct SIMDVoiceEnvelope<T: Simd> {
     state: VoiceEnvelopeState<T>,
     sample_rate: f32,
     killed: bool,
+    /// 性能探针采样标记（仅 `voice_probe` feature 且命中采样时计时本包络）。
+    #[cfg_attr(not(feature = "voice_probe"), allow(dead_code))]
+    probe: bool,
 }
 
 impl<T: Simd> SIMDVoiceEnvelope<T> {
@@ -276,6 +279,7 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
         params: EnvelopeParameters,
         allow_release: bool,
         sample_rate: f32,
+        probe: bool,
     ) -> Self {
         let state = params.get_stage_data(EnvelopeStage::Delay, params.start);
 
@@ -286,6 +290,7 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
             state,
             sample_rate,
             killed: false,
+            probe,
         }
     }
 
@@ -451,6 +456,28 @@ impl<T: Simd> VoiceGeneratorBase for SIMDVoiceEnvelope<T> {
 impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> {
     #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<T> {
+        // 性能探针：仅命中采样的 voice 记录包络耗时（TSC，~6ns/次）。
+        #[cfg(feature = "voice_probe")]
+        let probe_start = if self.probe {
+            crate::voice_probe::tick()
+        } else {
+            None
+        };
+
+        let out = self.next_sample_inner();
+
+        #[cfg(feature = "voice_probe")]
+        if let (Some(t0), Some(t1)) = (probe_start, crate::voice_probe::tick()) {
+            crate::voice_probe::record_env_ticks(t1.saturating_sub(t0));
+        }
+
+        out
+    }
+}
+
+impl<T: Simd> SIMDVoiceEnvelope<T> {
+    /// 实际包络推进（探针计时包裹在 `next_sample` 中；递归必须走本函数避免重复计时）。
+    fn next_sample_inner(&mut self) -> SIMDSampleMono<T> {
         simd_invoke!(T, {
             match &mut self.state.stage_data {
                 StageData::Lerp(lerper, stage_time) => {
@@ -463,7 +490,7 @@ impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> 
                             // Is ended, except the SIMD array isn't intersecting the end.
                             // Therefore can jump to the next stage, and try again
                             self.switch_to_next_stage();
-                            self.next_sample()
+                            self.next_sample_inner()
                         }
                     } else {
                         // No special conditions happening, return the next entire simd array lerped
@@ -478,7 +505,7 @@ impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> 
                             self.manually_build_simd_sample()
                         } else {
                             self.switch_to_next_stage();
-                            self.next_sample()
+                            self.next_sample_inner()
                         }
                     } else {
                         let values = lerper.lerp_simd(stage_time.progress_simd_array());
@@ -492,7 +519,7 @@ impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> 
                             self.manually_build_simd_sample()
                         } else {
                             self.switch_to_next_stage();
-                            self.next_sample()
+                            self.next_sample_inner()
                         }
                     } else {
                         let values = lerper.lerp_simd(stage_time.progress_simd_array());
@@ -649,7 +676,7 @@ mod tests {
                     } if target == 0.4 && duration == 17
                 ));
 
-                let mut env = SIMDVoiceEnvelope::<S>::new(params, params, true, 1.0);
+                let mut env = SIMDVoiceEnvelope::<S>::new(params, params, true, 1.0, false);
 
                 let mut i = 0;
                 while i < 48 {

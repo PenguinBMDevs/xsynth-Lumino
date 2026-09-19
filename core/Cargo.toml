@@ -33,8 +33,10 @@ tracy-client = { version = "0.19.0", optional = true, default-features = false, 
 
 [features]
 serde = ["dep:serde"]
-# Tracy 性能剖析插桩：启用后在音频渲染热路径发射 zone（未启动 Tracy 客户端时自动降级为空操作）
+# Tracy 性能插桩：启用后音频渲染热路径发射 zone；未启动 Tracy 客户端时自动降级为空操作。
 tracy = ["dep:tracy-client"]
+# 性能探针：对 1/N voice 做阶段级耗时采样（运行期 XSYNTH_VOICE_PROBE=1 开启）。
+voice_probe = []
 
 [dev-dependencies]
 midi-toolkit-rs = "0.1.0"

@@ -5,7 +5,11 @@ pub use xsynth_soundfonts::FilterType;
 
 #[derive(Clone)]
 pub(crate) struct BiQuadFilter {
-    filter: DirectForm1<f32>,
+    coeffs: Coefficients<f32>,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
 }
 
 impl BiQuadFilter {
@@ -13,7 +17,11 @@ impl BiQuadFilter {
         let coeffs = Self::get_coeffs(fil_type, freq, sample_rate, q);
 
         Self {
-            filter: DirectForm1::<f32>::new(coeffs),
+            coeffs,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
         }
     }
 
@@ -53,11 +61,26 @@ impl BiQuadFilter {
     }
 
     pub fn set_coefficients(&mut self, coeffs: Coefficients<f32>) {
-        self.filter.replace_coefficients(coeffs);
+        self.coeffs = coeffs;
     }
 
+    /// 直接形式 I biquad（与 `biquad` crate `DirectForm1` 的公式逐项一致）。
+    ///
+    /// 原实现调用 `biquad::DirectForm1::run`：跨 crate 且无 `#[inline]`，
+    /// 每个样本一次真实函数调用（每 voice 每 8 帧 16 次，逐声部滤波的主要开销）。
+    /// 就地实现后可被本 crate 内联；运算顺序不变（无 FMA contraction），输出逐位一致。
+    #[inline(always)]
     pub fn process(&mut self, input: f32) -> f32 {
-        self.filter.run(input)
+        let out = self.coeffs.b0 * input + self.coeffs.b1 * self.x1 + self.coeffs.b2 * self.x2
+            - self.coeffs.a1 * self.y1
+            - self.coeffs.a2 * self.y2;
+
+        self.x2 = self.x1;
+        self.x1 = input;
+        self.y2 = self.y1;
+        self.y1 = out;
+
+        out
     }
 
     #[inline(always)]

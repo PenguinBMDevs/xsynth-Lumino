@@ -166,6 +166,7 @@ impl<S: Simd + Send + Sync> MonoSampledVoiceSpawner<S> {
             modified_params,
             allow_release,
             self.stream_params.sample_rate as f32,
+            false,
         );
 
         let amp = VoiceCombineSIMD::mult(volume_envelope, gen);

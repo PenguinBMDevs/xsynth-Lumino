@@ -206,23 +206,25 @@ impl VoiceChannel {
     }
 
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
-        self.params.load_program();
+        crate::profiling::tracy_zone!("ch_apply_events", {
+            self.params.load_program();
 
-        // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
-        for key in self.key_voices.iter_mut() {
-            for e in key.event_cache.drain(..) {
-                key.data.send_event(
-                    e,
-                    &self.voice_control_data,
-                    &self.params.channel_sf,
-                    self.params.layers,
-                );
+            // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
+            for key in self.key_voices.iter_mut() {
+                for e in key.event_cache.drain(..) {
+                    key.data.send_event(
+                        e,
+                        &self.voice_control_data,
+                        &self.params.channel_sf,
+                        self.params.layers,
+                    );
+                }
             }
-        }
 
-        // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
-        //    使渲染负载有上界，同时不丢刚触发的音符。
-        self.enforce_max_voices();
+            // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
+            //    使渲染负载有上界，同时不丢刚触发的音符。
+            self.enforce_max_voices();
+        });
 
         // 3) 渲染（可并行）。
         out.fill(0.0);
@@ -231,21 +233,27 @@ impl VoiceChannel {
                 Some(pool) => {
                     let len = out.len();
                     let key_voices = &mut self.key_voices;
-                    pool.install(|| {
-                        key_voices.par_iter_mut().for_each(move |key| {
-                            prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
-                            key.data.render_to(&mut key.audio_cache);
+                    crate::profiling::tracy_zone!("ch_keys_render", {
+                        pool.install(|| {
+                            key_voices.par_iter_mut().for_each(move |key| {
+                                prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
+                                key.data.render_to(&mut key.audio_cache);
+                            });
                         });
                     });
 
-                    for key in self.key_voices.iter() {
-                        sum_simd(&key.audio_cache, out);
-                    }
+                    crate::profiling::tracy_zone!("ch_keys_sum", {
+                        for key in self.key_voices.iter() {
+                            sum_simd(&key.audio_cache, out);
+                        }
+                    });
                 }
                 None => {
-                    for key in self.key_voices.iter_mut() {
-                        key.data.render_to(out);
-                    }
+                    crate::profiling::tracy_zone!("ch_keys_render", {
+                        for key in self.key_voices.iter_mut() {
+                            key.data.render_to(out);
+                        }
+                    });
                 }
             }
         });

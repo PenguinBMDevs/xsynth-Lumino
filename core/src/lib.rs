@@ -3,6 +3,8 @@
 
 mod profiling;
 
+mod voice_probe;
+
 pub mod buffered_renderer;
 
 pub mod channel;

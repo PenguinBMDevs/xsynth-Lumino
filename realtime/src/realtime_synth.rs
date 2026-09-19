@@ -829,17 +829,23 @@ fn spawn_channel_thread(
                 let mut vec = match command {
                     // 全局治理：只抢占声部，不渲染、不回送音频块。
                     ChannelCommand::Steal(count) => {
-                        channel.steal_voices(count);
+                        crate::profiling::tracy_zone!("ch_gov", {
+                            channel.steal_voices(count);
+                        });
                         continue;
                     }
                     // L2 重度治理：硬移除（跳过淡出）。
                     ChannelCommand::HardSteal(count) => {
-                        channel.steal_voices_hard(count);
+                        crate::profiling::tracy_zone!("ch_gov", {
+                            channel.steal_voices_hard(count);
+                        });
                         continue;
                     }
                     // L4 看门狗：每键仅保留最新 N 组，立即释放其余。
                     ChannelCommand::WatchdogReset(keep) => {
-                        channel.trim_to_newest(keep);
+                        crate::profiling::tracy_zone!("ch_gov", {
+                            channel.trim_to_newest(keep);
+                        });
                         continue;
                     }
                     ChannelCommand::Render(vec) => vec,
@@ -1077,6 +1083,48 @@ fn build_output_stream(
     }
 }
 
+/// 线程 CPU 周期计数（仅 Windows + tracy）：
+/// 用于区分「回调线程真的在算」与「回调线程被调度器抢占/排队」。
+#[cfg(all(windows, feature = "tracy"))]
+mod thread_cpu_cycles {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn QueryThreadCycleTime(thread: *mut core::ffi::c_void, cycles: *mut u64) -> u8;
+    }
+
+    /// 当前线程累计 CPU 周期（含内核态）；调用失败返回 `None`。
+    pub fn now() -> Option<u64> {
+        unsafe {
+            let mut cycles = 0u64;
+            let ok = QueryThreadCycleTime(GetCurrentThread(), &mut cycles);
+            (ok != 0).then_some(cycles)
+        }
+    }
+
+    /// 周期 → 纳秒换算比（首次调用时忙等 5ms 标定一次）。
+    pub fn cycles_per_ns() -> f64 {
+        static RATIO: OnceLock<f64> = OnceLock::new();
+        *RATIO.get_or_init(|| {
+            let c0 = now().unwrap_or(0);
+            let t0 = Instant::now();
+            while t0.elapsed().as_micros() < 5000 {
+                std::hint::spin_loop();
+            }
+            let c1 = now().unwrap_or(0);
+            let ns = t0.elapsed().as_nanos().max(1) as f64;
+            (c1.saturating_sub(c0) as f64 / ns).max(0.001)
+        })
+    }
+}
+
 fn build_output_stream_for<T: SizedSample + ConvertSample>(
     device: &Device,
     stream_config: SupportedStreamConfig,
@@ -1096,16 +1144,56 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
     let mut output_vec = Vec::new();
     let mut limiter = VolumeLimiter::new(stream_config.channels());
 
+    // 采样缓冲余量读数（获取一次即可，回调内无锁读取，用于观察缓冲是否被抽干）。
+    #[cfg(feature = "tracy")]
+    let buffer_stats = {
+        let guard = buffered.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get_buffer_stats()
+    };
+
     Ok(device.build_output_stream(
         &stream_config.into(),
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            #[cfg(all(windows, feature = "tracy"))]
+            let cpu_start = thread_cpu_cycles::now();
+            #[cfg(all(windows, feature = "tracy"))]
+            let wall_start = Instant::now();
+
             crate::profiling::tracy_zone!("audio_callback", {
                 output_vec.resize(data.len(), 0.0);
-                buffered.lock().unwrap().read(&mut output_vec);
-                for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
-                    data[i] = ConvertSample::from_f32(s);
-                }
+
+                // 分离「等锁 / 读缓冲 / 限幅+写出」三段，用于定位回调内阻塞点。
+                let mut guard = crate::profiling::tracy_zone!("audio_lock", {
+                    buffered.lock().unwrap()
+                });
+                crate::profiling::tracy_zone!("audio_read", {
+                    guard.read(&mut output_vec);
+                });
+                drop(guard);
+
+                crate::profiling::tracy_zone!("audio_limit", {
+                    for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
+                        data[i] = ConvertSample::from_f32(s);
+                    }
+                });
             });
+
+            // CPU/墙钟比：接近 1 = 真的在算；远小于 1 = 被调度器抢占/排队。
+            #[cfg(all(windows, feature = "tracy"))]
+            if let (Some(c0), Some(c1)) = (cpu_start, thread_cpu_cycles::now()) {
+                let wall_ns = wall_start.elapsed().as_nanos().max(1) as f64;
+                let cpu_ns = c1.saturating_sub(c0) as f64 / thread_cpu_cycles::cycles_per_ns();
+                let frac = (cpu_ns / wall_ns).clamp(0.0, 1.0);
+                if let Some(client) = tracy_client::Client::running() {
+                    client.plot(tracy_client::plot_name!("audio_cpu_frac"), frac);
+                    // 缓冲余量（交织 f32 计数；chunk=960 时目标 4800 ≈ 5 块 ≈ 50ms）。
+                    client.plot(
+                        tracy_client::plot_name!("audio_buffered_samples"),
+                        buffer_stats.samples() as f64,
+                    );
+                }
+            }
+
             crate::profiling::tracy_frame!();
         },
         err_fn,
