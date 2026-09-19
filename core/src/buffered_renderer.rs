@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     thread::{self, JoinHandle},
@@ -14,6 +14,26 @@ use crossbeam_channel::{unbounded, Receiver};
 use crate::AudioStreamParams;
 
 use super::AudioPipe;
+
+/// 缓冲已满时的单次等待粒度上限（秒）。
+///
+/// 缓冲充足时渲染线程没有任何截止期限需要保精度，用 `native_sleep`（纯内核等待、
+/// 不自旋）粗睡即可：唤醒频率仍 ≥ 每秒 30 次，远高于缓冲耗尽所需的分辨率。
+/// 历史实现用 `spin_sleep::sleep(delay / 10)`（0.9ms）——`spin_sleep` 的语义是
+/// 「粗睡 + 尾部自旋到 deadline」，而 0.9ms 恰好小于其 Windows 精度阈值（700µs），
+/// 于是每次都退化为自旋，白白烧掉一整个核的若干个百分点。
+const CUSHION_WAIT_MAX_SECS: f64 = 0.03;
+
+/// 缓冲已满时的单次等待时长（秒）。
+///
+/// **安全不变量**：`buffered_secs >= block_secs` 时，`buffered_secs - 返回值 >= block_secs`
+/// 恒成立（`wait <= (buffered - block) / 2`）。按实时消费速度，睡满后缓冲里至少还剩
+/// 一个整块，因此醒来即可继续渲染，**结构上不可能造成欠载**。
+fn cushion_wait_secs(buffered_secs: f64, block_secs: f64, max_wait_secs: f64) -> f64 {
+    ((buffered_secs - block_secs) * 0.5)
+        .min(max_wait_secs)
+        .max(0.0)
+}
 
 /// 目标缓冲余量（交织 f32 计数）。
 ///
@@ -106,7 +126,7 @@ pub struct BufferedRenderer {
     remainder: Vec<f32>,
 
     /// Whether the render thread should be killed.
-    killed: Arc<RwLock<bool>>,
+    killed: Arc<AtomicBool>,
 
     /// The thread handle to wait for at the end.
     thread_handle: Option<JoinHandle<()>>,
@@ -141,7 +161,7 @@ impl BufferedRenderer {
 
         let render_time = Arc::new(RwLock::new(VecDeque::new()));
 
-        let killed = Arc::new(RwLock::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
 
         let thread_handle = {
             let samples = samples.clone();
@@ -173,15 +193,33 @@ impl BufferedRenderer {
                         size,
                         stream_params.channels.count() as usize,
                     );
+                    // 缓冲充足时的等待：`native_sleep` 只做内核等待、**不自旋**。
+                    // 这里没有任何截止期限需要保精度（音频由缓冲余量兜底），
+                    // 自旋纯属浪费；等待粒度同时受「剩余余量」约束以保证不欠载。
+                    let channels = stream_params.channels.count() as usize;
+                    let interleaved_per_sec = stream_params.sample_rate as f64 * channels as f64;
+                    let block_secs = size as f64 / stream_params.sample_rate as f64;
                     loop {
-                        let samples = samples.load(Ordering::SeqCst);
-                        if samples > cushion_target {
-                            spin_sleep::sleep(delay / 10);
-                        } else {
+                        let buffered = samples.load(Ordering::SeqCst);
+                        if buffered <= cushion_target {
                             break;
                         }
 
-                        if *killed.read().unwrap() {
+                        // 安全上界见 `cushion_wait_secs`：醒来时缓冲里至少还剩一个整块。
+                        // 故本改动只减少唤醒次数，不改变任何一块音频的内容，也不会欠载。
+                        let buffered_secs = buffered.max(0) as f64 / interleaved_per_sec;
+                        let wait_secs = cushion_wait_secs(
+                            buffered_secs,
+                            block_secs,
+                            CUSHION_WAIT_MAX_SECS.min(delay.as_secs_f64()),
+                        );
+                        if wait_secs > 0.0 {
+                            spin_sleep::native_sleep(Duration::from_secs_f64(wait_secs));
+                        } else {
+                            thread::yield_now();
+                        }
+
+                        if killed.load(Ordering::Acquire) {
                             return;
                         }
                     }
@@ -214,10 +252,12 @@ impl BufferedRenderer {
                         }
                     }
 
-                    // Sleep until the next iteration
+                    // Sleep until the next iteration.
+                    // 与缓冲等待同理：`native_sleep` 的抖动（平均 ~150µs、最坏 ~730µs）
+                    // 远小于缓冲余量，不需要 `spin_sleep` 的尾部自旋换来的亚毫秒精度。
                     let now = Instant::now();
                     if end > now {
-                        spin_sleep::sleep(end - now);
+                        spin_sleep::native_sleep(end - now);
                     }
                 })?
         };
@@ -301,7 +341,7 @@ impl BufferedRenderer {
 
 impl Drop for BufferedRenderer {
     fn drop(&mut self) {
-        *self.killed.write().unwrap() = true;
+        self.killed.store(true, Ordering::Release);
         if let Some(handle) = self.thread_handle.take() {
             if handle.join().is_err() {
                 eprintln!("xsynth-core: buffered renderer thread panicked during shutdown");
@@ -330,7 +370,10 @@ mod tests {
         },
     };
 
-    use super::{BufferedRendererStats, BufferedRendererStatsReader, cushion_target_interleaved};
+    use super::{
+        BufferedRendererStats, BufferedRendererStatsReader, CUSHION_WAIT_MAX_SECS,
+        cushion_target_interleaved, cushion_wait_secs,
+    };
 
     #[test]
     fn average_renderer_load_is_zero_when_no_samples_have_been_rendered() {
@@ -356,5 +399,42 @@ mod tests {
         assert_eq!(cushion_target_interleaved(100, 480, 2), 960);
         // 单声道：帧 == 交织计数
         assert_eq!(cushion_target_interleaved(4800, 480, 1), 4800);
+    }
+
+    #[test]
+    fn cushion_wait_never_drains_below_one_block() {
+        // 这是「渲染线程粗睡不自旋」改动的安全契约：醒来时缓冲里必须还有一个整块。
+        // 覆盖真实配置组合：块 5/10/20ms，缓冲余量从「刚好一块」到「远端充足」。
+        for block_secs in [0.005f64, 0.01, 0.02] {
+            for buffered_secs in [
+                block_secs,
+                block_secs * 1.001,
+                block_secs * 1.5,
+                block_secs * 3.0,
+                0.1,
+                0.5,
+                3.0,
+            ] {
+                let wait = cushion_wait_secs(
+                    buffered_secs,
+                    block_secs,
+                    CUSHION_WAIT_MAX_SECS.min(block_secs * 0.9),
+                );
+                assert!(wait >= 0.0, "等待时长不得为负：{wait}");
+                assert!(
+                    wait <= CUSHION_WAIT_MAX_SECS,
+                    "等待时长必须受上限约束：{wait}"
+                );
+                assert!(
+                    buffered_secs - wait >= block_secs,
+                    "睡眠后不足一个整块（buffered={buffered_secs} block={block_secs} wait={wait}）"
+                );
+            }
+        }
+        // 缓冲不足一个块（异常/启动态）：不得产生等待，避免与消费者抢时间。
+        assert_eq!(cushion_wait_secs(0.004, 0.01, CUSHION_WAIT_MAX_SECS), 0.0);
+        assert_eq!(cushion_wait_secs(0.0, 0.01, CUSHION_WAIT_MAX_SECS), 0.0);
+        // 负计数（欠载瞬间 `samples` 可能为负）同样不得等待。
+        assert_eq!(cushion_wait_secs(-0.02, 0.01, CUSHION_WAIT_MAX_SECS), 0.0);
     }
 }
