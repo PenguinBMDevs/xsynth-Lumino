@@ -47,11 +47,18 @@ macro_rules! tracy_plot {
 }
 
 /// 未启用 `tracy` feature 时的空操作版本（零开销）。
+///
+/// 调用点通常在 `#[cfg(feature = "tracy")]` 之后，因此本版本在非 tracy 构建里
+/// 是"未使用"的，需要显式放行。
 #[cfg(not(feature = "tracy"))]
+#[allow(unused_macros)]
 macro_rules! tracy_plot {
     ($name:literal, $value:expr) => {{
         let _ = $value;
     }};
 }
 
+/// 调用点在非 tracy 构建里不展开（`#[cfg]` 门控），因此非 tracy 版本的宏与
+/// 再导出会显得"未使用"。
+#[allow(unused_imports)]
 pub(crate) use tracy_plot;

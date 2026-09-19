@@ -1332,8 +1332,9 @@ fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASE
         macro_rules! load_sample {
             ($hot:expr, $pos:expr, $ptr:expr, $len:expr) => {{
                 if in_range_const::<MODE_TAG, RELEASED>() {
-                    // SAFETY: 见 `in_range_const`（回绕后位置 + 线性余量 ≤ 缓冲长度）。
-                    unsafe { *$ptr.add($pos) }
+                    // SAFETY: 调用点位于 `unsafe` 步进块内；`in_range_const` 保证
+                    // 回绕后位置 + 线性余量 ≤ 缓冲长度（见 `uniform_chunk`）。
+                    *$ptr.add($pos)
                 } else {
                     $hot.load($pos, $ptr, $len)
                 }
