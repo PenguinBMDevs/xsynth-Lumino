@@ -86,6 +86,13 @@ impl KeyData {
         self.voices.push_voices(std::iter::once(voice), None);
     }
 
+    /// 测试专用：带每键上限注入 voice（复现 app 的 `SetLayerCount(Some(4))` 路径）。
+    #[cfg(test)]
+    pub(crate) fn push_voice_test_capped(&mut self, voice: Box<dyn Voice>, max_layers: usize) {
+        self.voices
+            .push_voices(std::iter::once(voice), Some(max_layers));
+    }
+
     pub fn has_voices(&self) -> bool {
         self.voices.has_voices()
     }

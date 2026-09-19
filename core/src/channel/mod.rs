@@ -667,6 +667,21 @@ mod batch_render_tests {
     }
 
     fn batch_voice(amp: f32) -> Box<dyn Voice> {
+        batch_voice_with_velocity(amp, 100)
+    }
+
+    /// 同上，但指定力度（复现「低力度持音 vs 高力度新音」的抢占优先级）。
+    fn batch_voice_with_velocity(amp: f32, velocity: u8) -> Box<dyn Voice> {
+        batch_voice_impl(amp, velocity, LoopMode::LoopSustain)
+    }
+
+    /// NoLoop 形态（app 音源 TWGMD/Nexus/GarageBand 的区域全是 NoLoop）：
+    /// `signal_release` 不改写读取位置，因此可用来单独观察「抢占是否做了淡出」。
+    fn batch_voice_noloop(amp: f32, velocity: u8) -> Box<dyn Voice> {
+        batch_voice_impl(amp, velocity, LoopMode::NoLoop)
+    }
+
+    fn batch_voice_impl(amp: f32, velocity: u8, loop_mode: LoopMode) -> Box<dyn Voice> {
         let samples: Arc<[f32]> = (0..4_096)
             .map(|i| (i as f32 * 0.01).sin() * 0.5)
             .collect::<Vec<_>>()
@@ -687,7 +702,7 @@ mod batch_render_tests {
             gain_r: amp,
             samples_l: samples.clone(),
             samples_r: samples,
-            loop_mode: LoopMode::LoopSustain,
+            loop_mode,
             loop_offset: 0,
             loop_start: 100,
             loop_end: 3_000,
@@ -702,7 +717,7 @@ mod batch_render_tests {
             envelope: env,
             sample_rate: SR as f32,
             group_len: crate::voice::batch_chunk_width() as u8,
-            velocity: 100,
+            velocity,
             exclusive_class: None,
         };
         Box::new(StereoBatchVoice::new(
@@ -750,6 +765,138 @@ mod batch_render_tests {
         channel
     }
 
+    /// 端到端回归（用户症状）：通道渲染路径下，按住不放的 sustain 长音不得被
+    /// `remove_ended_voices` 提前移除。
+    ///
+    /// 判据：`voice_count()` 在每一块都必须保持不变（声部被移除 = 硬切，无 release
+    /// 尾巴），且末块仍在发声。批渲染路径与逐 voice 路径都要成立——缺陷在采样读取器
+    /// 本身，两条路径共享同一语义（批 lane 是镜像）。
+    #[test]
+    fn held_sustain_voice_survives_channel_voice_reaping() {
+        const VOICES: usize = 8;
+        const BLOCKS: usize = 40;
+
+        let mut batched = VoiceChannel::new(
+            ChannelInitOptions::default(),
+            AudioStreamParams::new(SR, ChannelCount::Stereo),
+            None,
+        );
+        let mut per_voice = VoiceChannel::new(
+            ChannelInitOptions::default(),
+            AudioStreamParams::new(SR, ChannelCount::Stereo),
+            None,
+        );
+        for _ in 0..VOICES {
+            batched.key_voices[0].data.push_voice_test(batch_voice(0.4));
+            per_voice.key_voices[0]
+                .data
+                .push_voice_test(batch_voice(0.4));
+        }
+
+        let mut batched_buf = vec![0.0f32; FRAMES * 2];
+        let mut per_voice_buf = vec![0.0f32; FRAMES * 2];
+        for block in 0..BLOCKS {
+            batched_buf.fill(0.0);
+            per_voice_buf.fill(0.0);
+            batched.render_batched(&mut batched_buf);
+            for key in per_voice.key_voices.iter_mut() {
+                key.data.render_to(&mut per_voice_buf);
+            }
+
+            assert_eq!(
+                batched.key_voices[0].data.voice_count(),
+                VOICES,
+                "批渲染：第 {block} 块后长音声部被提前移除（硬切）"
+            );
+            assert_eq!(
+                per_voice.key_voices[0].data.voice_count(),
+                VOICES,
+                "逐 voice：第 {block} 块后长音声部被提前移除（硬切）"
+            );
+        }
+
+        assert!(
+            batched_buf.iter().any(|s| s.abs() > 1e-3),
+            "末块批渲染输出应为非静音（声部仍在发声）"
+        );
+        assert!(
+            per_voice_buf.iter().any(|s| s.abs() > 1e-3),
+            "末块逐 voice 输出应为非静音（声部仍在发声）"
+        );
+    }
+
+    /// 音频级回归（复现 app 配置：`SetLayerCount(Some(4))` + `fade_out_killing = false`）：
+    /// 同键反复触发导致每键上限抢占时，输出**不得出现采样级硬切**。
+    ///
+    /// 用 NoLoop 形态（= app 音源的实际形态）：`signal_release` 不改写读取位置，
+    /// 因此块内跳变只可能来自「抢占是否做了淡出」。
+    /// 判据：块内相邻采样最大跳变（同声道）。正常信号（~76Hz 正弦）每采样斜率 ~1e-3；
+    /// 零淡出硬切 = 被抢声部的瞬时幅值（~1e-1）直接消失 → 跳变放大两个数量级；
+    /// 1ms 淡出（48 帧 @48k）只贡献 ~幅值/48 的斜率，与信号自身同量级。
+    #[test]
+    fn layer_cap_steal_fades_instead_of_hard_cutting_audio() {
+        fn max_step_same_channel(buf: &[f32], prev_last: (f32, f32)) -> f32 {
+            let frames = buf.len() / 2;
+            // 跨块边界：抢占是在块间发生的，硬切首先出现在边界上（历史盲区：只测块内会漏）。
+            let mut best = (buf[0] - prev_last.0)
+                .abs()
+                .max((buf[1] - prev_last.1).abs());
+            for i in 1..frames {
+                best = best.max((buf[i * 2] - buf[(i - 1) * 2]).abs());
+                best = best.max((buf[i * 2 + 1] - buf[(i - 1) * 2 + 1]).abs());
+            }
+            best
+        }
+
+        fn last_frame(buf: &[f32]) -> (f32, f32) {
+            let frames = buf.len() / 2;
+            (buf[(frames - 1) * 2], buf[(frames - 1) * 2 + 1])
+        }
+
+        const MAX_LAYERS: usize = 4;
+        let mut channel = VoiceChannel::new(
+            ChannelInitOptions {
+                fade_out_killing: false,
+                max_voices: None,
+            },
+            AudioStreamParams::new(SR, ChannelCount::Stereo),
+            None,
+        );
+
+        // 按住的长音（低力度 → 若不保护，会因"最轻"被优先抢走）。
+        channel.key_voices[0]
+            .data
+            .push_voice_test_capped(batch_voice_noloop(0.4, 10), MAX_LAYERS);
+
+        let mut buf = vec![0.0f32; FRAMES * 2];
+        let mut prev = (0.0f32, 0.0f32);
+        buf.fill(0.0);
+        channel.render_batched(&mut buf);
+        let calm_step = max_step_same_channel(&buf, prev);
+        prev = last_frame(&buf);
+
+        // 同键再触发 MAX_LAYERS 次：第 4 次会让活跃数超过上限 → 触发抢占。
+        let mut steal_step = 0.0f32;
+        for _ in 0..MAX_LAYERS {
+            channel.key_voices[0]
+                .data
+                .push_voice_test_capped(batch_voice_noloop(0.4, 100), MAX_LAYERS);
+            buf.fill(0.0);
+            channel.render_batched(&mut buf);
+            steal_step = steal_step.max(max_step_same_channel(&buf, prev));
+            prev = last_frame(&buf);
+        }
+
+        assert!(
+            steal_step < 0.03,
+            "抢占块出现了采样级硬切：steal_step={steal_step}（calm_step={calm_step}）\
+             —— 每键上限抢占必须走 1ms 淡出"
+        );
+        assert!(
+            channel.key_voices[0].data.active_voice_count() <= MAX_LAYERS,
+            "每键活跃声部上限必须维持"
+        );
+    }
     #[test]
     fn render_batched_matches_per_voice_render_and_visits_every_voice() {
         let batched_counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];

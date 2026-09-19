@@ -115,46 +115,59 @@ impl VoiceBuffer {
         self.id_counter
     }
 
-    /// Pops the quietest voice group. Multiple voices can be part of the same group
-    /// based on their ID (e.g. a note and a hammer playing at the same time for a note on event)
+    /// 抢占同键上「最不重要」的一组声部：**优先已进入 release 的组**（正在衰减的
+    /// 尾巴），其次最轻者（并列取最老——从队首迭代、严格小于保持首个）。
+    ///
+    /// 两条硬约束（修复「长音被直接杀掉」）：
+    ///
+    /// 1. **永远走 1ms 淡出**（`kill_voice_fade_out`），不做零淡出硬切。
+    ///    历史实现按 `fade_out_killing` 分支，关闭时用 `buffer.drain()` 立即出队：
+    ///    那是采样级不连续 —— 既是可闻 click，也正是用户报告的「长音无法完整播放、
+    ///    音符被直接杀掉」（同键第 N+1 次触发把仍在响的持音瞬间抹掉）。
+    ///    淡出后的组由 `remove_ended_voices`（同块末）或 `KILL_DEADLINE_BLOCKS`
+    ///    死期限清理，保留量由 `trim_excess_fading_voices` 兜底。
+    /// 2. **保护持音**：SF2 sustain 循环、延音踏板下的长音都是「未释放」；
+    ///    优先抢 release 中的尾巴 → 重复音符杀掉的总是前一次的余音，
+    ///    只有在同键所有组都未释放时才会命中持音（复音上限仍然严格维持）。
     fn pop_quietest_voice_group(&mut self, ignored_id: usize) {
         if self.buffer.is_empty() {
             return;
         }
 
-        let mut quietest = u8::MAX;
-        let mut quietest_index = 0;
-        let mut quietest_id = 0;
-        let mut count = 0;
-        for i in 0..self.buffer.len() {
-            let voice = &self.buffer[i];
+        // 一次遍历选出：T1 = release 中的最轻组；T2 = 全体最轻组（并列取最老）。
+        let mut releasing: Option<(usize, usize, u8)> = None; // (index, id, vel)
+        let mut quietest: Option<(usize, usize, u8)> = None;
+        for (i, voice) in self.buffer.iter().enumerate() {
             if voice.id == ignored_id || voice.is_killed() {
                 continue;
             }
             let vel = voice.velocity();
-            if quietest_id == voice.id {
-                count += 1;
-            } else if vel < quietest || i == 0 {
-                quietest = vel;
-                quietest_index = i;
-                quietest_id = voice.id;
-                count = 1;
+            if voice.is_releasing() && releasing.is_none_or(|(_, _, v)| vel < v) {
+                releasing = Some((i, voice.id, vel));
+            }
+            if quietest.is_none_or(|(_, _, v)| vel < v) {
+                quietest = Some((i, voice.id, vel));
             }
         }
 
-        if count > 0 {
-            if self.options.fade_out_killing {
-                for i in quietest_index..(quietest_index + count) {
-                    self.kill_voice_fade_out(i);
-                }
-            } else {
-                self.buffer.drain(quietest_index..(quietest_index + count));
-                self.adjust_counter(-(count as isize));
-            }
+        let Some((victim_index, victim_id, _)) = releasing.or(quietest) else {
+            return;
+        };
 
-            if let Some(index) = self.held_by_damper.iter().position(|&x| x == quietest_id) {
-                self.held_by_damper.remove(index);
-            }
+        // 组大小 = 该 id 在选中下标处连续出现的个数（同一次 NoteOn 的声部共用 id）。
+        let mut count = 0usize;
+        while victim_index + count < self.buffer.len()
+            && self.buffer[victim_index + count].id == victim_id
+        {
+            count += 1;
+        }
+
+        for i in victim_index..(victim_index + count) {
+            self.kill_voice_fade_out(i);
+        }
+
+        if let Some(index) = self.held_by_damper.iter().position(|&x| x == victim_id) {
+            self.held_by_damper.remove(index);
         }
     }
 
@@ -189,13 +202,10 @@ impl VoiceBuffer {
     }
 
     fn get_active_count(&mut self) -> usize {
-        let mut active = 0;
-        for i in 0..self.buffer.len() {
-            if !self.buffer[i].deref().is_killed() {
-                active += 1;
-            }
-        }
-        active
+        self.buffer
+            .iter()
+            .filter(|group| !(**group).is_killed())
+            .count()
     }
 
     /// Pushes a new set of voices for a single note on event. Multiple voices can be part of the same group
@@ -221,47 +231,51 @@ impl VoiceBuffer {
         if let Some(max_voices) = max_voices {
             if len > max_voices {
                 self.pop_quietest_voice_group(id);
-            } else if self.options.fade_out_killing {
-                while self.get_active_count() > max_voices {
-                    self.pop_quietest_voice_group(id);
-                }
             } else {
-                while self.buffer.len() > max_voices {
+                // 上限按**活跃**（未被 Kill）组计，而不是 buffer 长度：被 Kill 的组正在
+                // 1ms 淡出，若按 buffer 长度计会导致每次 push 都叠加额外抢占
+                // （淡出保留 → buffer 变长 → 再抢一个 → 再淡出 ……）。
+                while self.get_active_count() > max_voices {
                     self.pop_quietest_voice_group(id);
                 }
             }
 
             // 淡出保留上限：防止被杀 voice 在事件积压时无界累积，导致
             // `get_active_count` / `pop_quietest_voice_group` 的全 buffer 扫描
-            // 在单个渲染块内退化为 O(n²)。仅截短过载时最老的淡出（听感代价最小），
-            // 正常负载下保留量低于上限，淡出质量不受影响。
-            if self.options.fade_out_killing {
-                self.trim_excess_fading_voices(max_voices);
-            }
+            // 在单个渲染块内退化为 O(n²)。每键上限的抢占现在**始终**走淡出，
+            // 因此这一步必须无条件执行（不再依赖 `fade_out_killing`）。
+            self.trim_excess_fading_voices(max_voices);
         }
     }
 
-    /// 将被杀（淡出中）voice 的数量裁剪到 `fading_retention_limit` 以内，
-    /// 超出部分优先丢弃最老的（最接近淡出结束，截短听感代价最小）。
+    /// 将被杀（淡出中）voice 的数量裁剪到 `fading_retention_limit` 以内。
+    ///
+    /// 丢弃顺序：**从最老（队首）开始**——它们最接近淡出结束（1ms 淡出 ≈ 块内即完成），
+    /// 硬截的听感代价最小。历史实现在此处保留了最老的、丢弃最新的，等于把刚开始
+    /// 淡出（电平仍高）的 voice 直接抹掉 —— 又一次采样级不连续。
     fn trim_excess_fading_voices(&mut self, max_voices: usize) {
         let limit = fading_retention_limit(max_voices);
         // 快速路径：buffer 未超过「active 上限 + 淡出保留上限」时无需扫描。
         if self.buffer.len() <= max_voices.saturating_add(limit) {
             return;
         }
-        let mut kept = 0usize;
+        let killed = self
+            .buffer
+            .iter()
+            .filter(|group| group.voice.is_killed())
+            .count();
+        let mut to_drop = killed.saturating_sub(limit);
         let mut removed = 0isize;
-        self.buffer.retain(|group| {
-            if group.voice.is_killed() {
-                kept += 1;
-                if kept <= limit {
-                    return true;
+        if to_drop > 0 {
+            self.buffer.retain(|group| {
+                if to_drop > 0 && group.voice.is_killed() {
+                    to_drop -= 1;
+                    removed += 1;
+                    return false;
                 }
-                removed += 1;
-                return false;
-            }
-            true
-        });
+                true
+            });
+        }
         // 权威计数不变量：物理移除必须同步 `voice_counter`
         // （rpn 的治理器/入场控制直接读它，漏计会让声部总数永久虚高）。
         self.adjust_counter(-removed);
@@ -437,10 +451,11 @@ mod tests {
         ReleaseType, Voice, VoiceControlData, VoiceGeneratorBase, VoiceSampleGenerator,
     };
 
-    /// 最小 Voice 实现：只关心偷声决策用到的 velocity / is_killed / ended。
+    /// 最小 Voice 实现：只关心偷声决策用到的 velocity / is_killed / is_releasing / ended。
     struct MockVoice {
         velocity: u8,
         killed: bool,
+        releasing: bool,
         ended: bool,
     }
 
@@ -449,6 +464,7 @@ mod tests {
             MockVoice {
                 velocity,
                 killed: false,
+                releasing: false,
                 ended: false,
             }
         }
@@ -475,7 +491,7 @@ mod tests {
 
     impl Voice for MockVoice {
         fn is_releasing(&self) -> bool {
-            false
+            self.releasing
         }
 
         fn is_killed(&self) -> bool {
@@ -551,8 +567,53 @@ mod tests {
     }
 
     #[test]
-    fn no_fade_out_drops_stolen_voices_immediately() {
-        // fade_out_killing = false 时保持原语义：偷声立即出队，buffer 有界。
+    fn layer_cap_steal_is_faded_even_without_fade_out_killing() {
+        // 回归（用户症状「长音无法完整播放、音符被直接杀掉」）：
+        // `fade_out_killing = false` 时，每键上限抢占**也必须**走 1ms 淡出。
+        // 历史实现走 `buffer.drain()` 零淡出硬切 = 采样级不连续（click）。
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut buffer = VoiceBuffer::new(
+            counter.clone(),
+            ChannelInitOptions {
+                fade_out_killing: false,
+                max_voices: None,
+            },
+        );
+        let max_voices = 2usize;
+        for _ in 0..100 {
+            push_one(&mut buffer, 50, max_voices);
+        }
+
+        assert_eq!(
+            buffer.get_active_count(),
+            2,
+            "活跃声部数必须严格受每键上限约束"
+        );
+        let killed = buffer.buffer.iter().filter(|g| g.voice.is_killed()).count();
+        assert!(
+            killed >= 1,
+            "被抢占的 voice 应停留在 Kill 淡出状态（不是被静默抹掉）"
+        );
+        assert!(
+            killed <= fading_retention_limit(max_voices),
+            "淡出保留量必须有界（O(n²) 防护）: killed={killed}"
+        );
+        assert!(
+            buffer.buffer.len() <= max_voices + fading_retention_limit(max_voices),
+            "淡出保留量必须有界（O(n²) 防护）: {}",
+            buffer.buffer.len()
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            buffer.buffer.len() as u64,
+            "权威计数必须与 buffer 严格同步"
+        );
+    }
+
+    #[test]
+    fn layer_cap_steal_protects_held_notes_and_takes_releasing_tail() {
+        // 保护持音：同键重复触发时，优先抢「已在 release 的尾巴」，
+        // 不能因为「最轻」而先把按住不放的长音（低力度）杀掉。
         let mut buffer = VoiceBuffer::new(
             Arc::new(AtomicU64::new(0)),
             ChannelInitOptions {
@@ -560,9 +621,30 @@ mod tests {
                 max_voices: None,
             },
         );
-        for _ in 0..100 {
-            push_one(&mut buffer, 50, 2);
-        }
-        assert!(buffer.buffer.len() <= 2, "无淡出时 buffer 不得超过每键上限");
+        buffer.push_voices(
+            std::iter::once(Box::new(MockVoice::new(10)) as Box<dyn Voice>),
+            Some(2),
+        );
+        let mut tail = MockVoice::new(120);
+        tail.releasing = true;
+        buffer.push_voices(std::iter::once(Box::new(tail) as Box<dyn Voice>), Some(2));
+        // 第三次触发：活跃 3 > 上限 2 → 抢占。应抢 release 中的尾巴（120），保留持音（10）。
+        buffer.push_voices(
+            std::iter::once(Box::new(MockVoice::new(100)) as Box<dyn Voice>),
+            Some(2),
+        );
+
+        let killed_velocities: Vec<u8> = buffer
+            .buffer
+            .iter()
+            .filter(|g| g.voice.is_killed())
+            .map(|g| g.voice.velocity())
+            .collect();
+        assert_eq!(
+            killed_velocities,
+            vec![120],
+            "必须优先抢占 release 中的尾巴，而不是最轻的持音"
+        );
+        assert_eq!(buffer.get_active_count(), 2);
     }
 }
