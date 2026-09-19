@@ -64,6 +64,12 @@ impl BiQuadFilter {
         self.coeffs = coeffs;
     }
 
+    /// B0 原型用：读取当前系数（测试构建）。
+    #[cfg(test)]
+    pub(crate) fn coefficients(&self) -> &Coefficients<f32> {
+        &self.coeffs
+    }
+
     /// 直接形式 I biquad（与 `biquad` crate `DirectForm1` 的公式逐项一致）。
     ///
     /// 原实现调用 `biquad::DirectForm1::run`：跨 crate 且无 `#[inline]`，

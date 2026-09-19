@@ -89,6 +89,28 @@ impl BufferSampler for BufferSamplers {
 
 // Enum sampler reader
 
+/// B0 原型用：绕过 `LoopParams`（pub(super)）直接构造读取器（测试构建）。
+#[cfg(test)]
+impl<Sampler: BufferSampler> SampleReaderLoopSustain<Sampler> {
+    pub(crate) fn new_raw(
+        buffer: Sampler,
+        offset: usize,
+        loop_start: usize,
+        loop_end: usize,
+    ) -> Self {
+        let length = Some(buffer.length());
+        Self {
+            buffer,
+            length,
+            offset,
+            loop_start,
+            loop_end,
+            last: 0,
+            is_released: false,
+        }
+    }
+}
+
 pub trait SampleReader: Send + Sync {
     fn get(&mut self, pos: usize) -> f32;
     fn is_past_end(&self, pos: usize) -> bool;

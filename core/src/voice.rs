@@ -10,6 +10,9 @@ pub(crate) use simd::*;
 mod simdvoice;
 pub(crate) use simdvoice::*;
 
+#[cfg(test)]
+mod batch_proto;
+
 mod base;
 pub(crate) use base::*;
 
