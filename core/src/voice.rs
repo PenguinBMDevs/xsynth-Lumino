@@ -10,6 +10,12 @@ pub(crate) use simd::*;
 mod simdvoice;
 pub(crate) use simdvoice::*;
 
+pub mod batch;
+pub use batch::BatchLane;
+pub(crate) use batch::{
+    BatchLaneInit, StereoBatchVoice, batch_chunk_width, batching_supported, render_batch_chunk,
+};
+
 #[cfg(test)]
 mod batch_proto;
 
@@ -96,4 +102,13 @@ pub trait Voice: VoiceSampleGenerator + Send + Sync {
 
     fn velocity(&self) -> u8;
     fn exclusive_class(&self) -> Option<u8>;
+
+    /// B1 批处理：返回可批 lane（仅批处理 voice 实现返回 `Some`，其余走默认 `None`）。
+    ///
+    /// 由 `VoiceChannel` 的批渲染路径调用；返回 `Some` 表示该 voice 的权威状态在
+    /// lane 内，渲染时由批内核驱动。
+    #[doc(hidden)]
+    fn batch_lane(&mut self) -> Option<&mut BatchLane> {
+        None
+    }
 }

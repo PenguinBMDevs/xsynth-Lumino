@@ -64,8 +64,7 @@ impl BiQuadFilter {
         self.coeffs = coeffs;
     }
 
-    /// B0 原型用：读取当前系数（测试构建）。
-    #[cfg(test)]
+    /// 读取当前系数（B1 批处理 lane 在 spawn 期快照系数；B0 原型同样使用）。
     pub(crate) fn coefficients(&self) -> &Coefficients<f32> {
         &self.coeffs
     }

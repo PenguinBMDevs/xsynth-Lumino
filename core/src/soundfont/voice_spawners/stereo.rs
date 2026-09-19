@@ -13,10 +13,10 @@ use crate::{
 use crate::{
     voice::VoiceControlData,
     voice::{
-        BufferSamplers, EnvelopeParameters, SIMDConstantControl, SIMDConstantStereo,
+        BatchLaneInit, BufferSamplers, EnvelopeParameters, SIMDConstantControl, SIMDConstantStereo,
         SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
         SIMDVoiceEnvelope, SampleReader, SampleReaderLoop, SampleReaderLoopSustain,
-        SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
+        SampleReaderNoLoop, StereoBatchVoice, Voice, VoiceBase, VoiceCombineSIMD,
     },
 };
 
@@ -79,10 +79,57 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         if probe {
             crate::voice_probe::record_voice_kind(self.filter.is_some());
         }
+        self.begin_voice_impl(control, !probe && crate::voice::batching_supported(), probe)
+    }
+
+    /// 构造 voice。`batch = true` 时优先构造 B1 批处理 voice（lane 即权威状态），
+    /// 否则构造原链式生成器。差分测试直接调用本函数对比两条路径（逐位一致）。
+    fn begin_voice_impl(
+        &self,
+        control: &VoiceControlData,
+        batch: bool,
+        probe: bool,
+    ) -> Box<dyn Voice> {
+        // B1 批处理：可批时 lane 直接作为权威状态（跳过整条链式生成器）。
+        // 被采样的 voice 不批（否则 Tracy 的阶段归因失真）。
+        if batch {
+            if let Some(voice) = self.make_batch_voice(control) {
+                return voice;
+            }
+        }
 
         // Currently there's only the f32 buffer samples, more could be added in the future.
         #[allow(clippy::redundant_closure)]
         self.make_sample_reader(control, |s| BufferSamplers::new_f32(s), probe)
+    }
+
+    /// B1：构造可批 voice。`LUMINO_BATCH` 关闭或 SIMD 宽度不足时返回 `None`（走原链路）。
+    fn make_batch_voice(&self, control: &VoiceControlData) -> Option<Box<dyn Voice>> {
+        if self.samples.len() < 2 {
+            return None;
+        }
+        let (gain_l, gain_r) = self.stereo_gains();
+        let init = BatchLaneInit {
+            speed_mult: self.speed_mult,
+            gain_l,
+            gain_r,
+            samples_l: self.samples[0].clone(),
+            samples_r: self.samples[1].clone(),
+            loop_mode: self.loop_params.mode,
+            loop_offset: self.loop_params.offset as usize,
+            loop_start: self.loop_params.start as usize,
+            loop_end: self.loop_params.end as usize,
+            loop_stop: self.loop_params.stop.map(|stop| stop as usize),
+            interpolator: self.interpolator,
+            filter: self.filter.clone(),
+            envelope: *self.volume_envelope_params,
+            sample_rate: self.stream_params.sample_rate as f32,
+            // 包络「8 帧组」大小必须与真实链路的运行时 SIMD 宽度一致（见 batch.rs）。
+            group_len: crate::voice::batch_chunk_width() as u8,
+            velocity: self.vel,
+            exclusive_class: self.exclusive_class,
+        };
+        Some(Box::new(StereoBatchVoice::new(&init, control)))
     }
 
     fn make_sample_reader<BS: 'static + BufferSampler>(
@@ -150,14 +197,18 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     ///
     /// 原实现是 `amp`（单声道常量乘）+ 声像增益（立体声乘）两层 `SIMDVoiceCombine`，
     /// 组合链上每层每 8 帧都要走一遍嵌套 next_sample；两者都是常量，相乘是等价的。
+    fn stereo_gains(&self) -> (f32, f32) {
+        let pan = self.pan * std::f32::consts::PI / 2.0;
+        let left = (pan.cos() * 1.42).min(1.0) * self.amp;
+        let right = (pan.sin() * 1.42).min(1.0) * self.amp;
+        (left, right)
+    }
+
     fn apply_gain<Gen>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, SIMDSampleStereo<S>>
     where
         Gen: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
     {
-        let pan = self.pan * std::f32::consts::PI / 2.0;
-        let left = (pan.cos() * 1.42).min(1.0) * self.amp;
-        let right = (pan.sin() * 1.42).min(1.0) * self.amp;
-
+        let (left, right) = self.stereo_gains();
         let gains = SIMDConstantStereo::<S>::new(left, right);
         VoiceCombineSIMD::mult(gains, gen)
     }
@@ -251,5 +302,360 @@ impl<S: 'static + Sync + Send + Simd> VoiceSpawner for StereoSampledVoiceSpawner
 
     fn exclusive_class(&self) -> Option<u8> {
         self.exclusive_class
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! B1 差分验证：批处理 lane 与真实链式生成器逐位一致。
+    //!
+    //! 三条独立口径：
+    //! 1. `BatchLane::render_scalar`（标量 lane）≡ 原链式生成器（逐位）；
+    //! 2. 批内核（向量 biquad + 水平求和）≡ 标量 lane（逐位，用「单活跃 lane +
+    //!    其余静音 lane」隔离混音求和顺序）；
+    //! 3. 8 lane 全部活跃时，内核与逐 voice 顺序渲染的差异仅为混音求和顺序造成的
+    //!    f32 舍入（1e-6 相对量级）。
+
+    use std::marker::PhantomData;
+
+    use simdeez::prelude::*;
+    use simdeez::simd_runtime_generate;
+
+    use super::*;
+    use crate::soundfont::{EnvelopeCurveType, EnvelopeDescriptor, EnvelopeOptions};
+    use crate::voice::{render_batch_chunk, BatchLane, ReleaseType, Voice};
+
+    const SR: u32 = 48_000;
+    const FRAMES: usize = 480;
+
+    fn sample_buffer(seed: f32) -> Arc<[f32]> {
+        (0..8_192)
+            .map(|i| {
+                let t = i as f32 * 0.01 + seed;
+                (t.sin() * 0.7 + (t * 2.13).sin() * 0.3) * 0.5
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// 覆盖全部阶段（Delay/Attack/Hold/Decay/Sustain/Release/Finished）的包络。
+    fn descriptor() -> EnvelopeDescriptor {
+        EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.004,
+            attack: 0.01,
+            hold: 0.006,
+            decay: 0.03,
+            sustain_percent: 0.35,
+            release: 0.05,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawner<S: 'static + Simd + Send + Sync>(
+        loop_mode: LoopMode,
+        interpolator: Interpolator,
+        filter: bool,
+        options: EnvelopeOptions,
+        amp: f32,
+        vel: u8,
+    ) -> StereoSampledVoiceSpawner<S> {
+        let stream_params = AudioStreamParams::new(SR, crate::ChannelCount::Stereo);
+        StereoSampledVoiceSpawner::<S> {
+            speed_mult: 1.0,
+            filter: filter.then(|| {
+                BiQuadFilter::new(
+                    crate::effects::FilterType::LowPass,
+                    9_000.0,
+                    SR as f32,
+                    Some(0.7),
+                )
+            }),
+            loop_params: LoopParams {
+                mode: loop_mode,
+                offset: 0,
+                start: 100,
+                end: 3_000,
+                stop: None,
+            },
+            amp,
+            pan: 0.3,
+            volume_envelope_params: Arc::new(descriptor().to_envelope_params(SR, options)),
+            samples: Arc::new([sample_buffer(0.0), sample_buffer(1.7)]),
+            interpolator,
+            exclusive_class: None,
+            vel,
+            stream_params,
+            _s: PhantomData,
+        }
+    }
+
+    fn all_cases() -> Vec<(LoopMode, Interpolator, bool)> {
+        let mut cases = Vec::new();
+        for mode in [
+            LoopMode::LoopSustain,
+            LoopMode::LoopContinuous,
+            LoopMode::NoLoop,
+            LoopMode::OneShot,
+        ] {
+            for interpolator in [Interpolator::Nearest, Interpolator::Linear] {
+                for filter in [true, false] {
+                    cases.push((mode, interpolator, filter));
+                }
+            }
+        }
+        cases
+    }
+
+    fn envelope_option_sets() -> [EnvelopeOptions; 2] {
+        [
+            EnvelopeOptions::default(),
+            EnvelopeOptions {
+                attack_curve: EnvelopeCurveType::Linear,
+                decay_curve: EnvelopeCurveType::Exponential,
+                release_curve: EnvelopeCurveType::Exponential,
+            },
+        ]
+    }
+
+    /// 口径 1：标量 lane ≡ 真实链式生成器（逐位），覆盖
+    /// 4 loop mode × 2 interpolator × 2 filter × 2 曲线组合 × 12 块，
+    /// 中途注入控制消息（pitch/attack/release）与 release/kill。
+    #[test]
+    fn batch_lane_matches_real_chain_bitwise() {
+        simd_runtime_generate!(
+            fn run() {
+                for (mode, interpolator, filter) in all_cases() {
+                    for options in envelope_option_sets() {
+                        for kill in [false, true] {
+                            let s = spawner::<S>(mode, interpolator, filter, options, 0.4, 100);
+                            let control = VoiceControlData::new_defaults();
+                            let mut real = s.begin_voice_impl(&control, false, false);
+                            let mut batch = s.begin_voice_impl(&control, true, false);
+                            assert!(
+                                batch.batch_lane().is_some(),
+                                "批 voice 未构造成功: {mode:?} {interpolator:?} filter={filter}"
+                            );
+
+                            let mut ctl = VoiceControlData::new_defaults();
+                            ctl.voice_pitch_multiplier = 1.25;
+                            ctl.envelope.attack = Some(90);
+                            ctl.envelope.release = Some(30);
+
+                            let mut real_buf = vec![0.0f32; FRAMES * 2];
+                            let mut batch_buf = vec![0.0f32; FRAMES * 2];
+                            for block in 0..12 {
+                                if block == 2 {
+                                    real.process_controls(&ctl);
+                                    batch.process_controls(&ctl);
+                                }
+                                if block == 4 {
+                                    real.signal_release(ReleaseType::Standard);
+                                    batch.signal_release(ReleaseType::Standard);
+                                }
+                                if block == 7 && kill {
+                                    real.signal_release(ReleaseType::Kill);
+                                    batch.signal_release(ReleaseType::Kill);
+                                }
+                                real_buf.fill(0.0);
+                                batch_buf.fill(0.0);
+                                real.render_to(&mut real_buf);
+                                batch.render_to(&mut batch_buf);
+
+                                assert_eq!(
+                                    real_buf, batch_buf,
+                                    "第 {block} 块输出不一致: {mode:?} {interpolator:?} \
+                                     filter={filter} kill={kill}"
+                                );
+                                assert_eq!(
+                                    real.ended(),
+                                    batch.ended(),
+                                    "第 {block} 块 ended() 不一致: {mode:?} {interpolator:?} \
+                                     filter={filter} kill={kill}"
+                                );
+                            }
+
+                            // 结束后仍应保持同步：OneShot 且未 Kill 时 `allow_release == false`，
+                            // 包络不会进入 Release（两路径一致地不结束）；其余组合应已 Finished。
+                            if kill || mode != LoopMode::OneShot {
+                                assert!(real.ended() && batch.ended());
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        run();
+    }
+
+    /// 口径 2：批内核 ≡ 标量 lane（逐位）。
+    ///
+    /// 活跃 lane 放在中间下标（验证任意 lane 位置），其余 lane 全部静音（`amp = 0`
+    /// → 增益为 0 → 经 biquad 后为 +0.0），因此水平求和 = 活跃 lane 的值，
+    /// 与逐 voice 顺序累加逐位等价。静音 lane 使用不同的 loop mode / 插值器，
+    /// 顺带覆盖内核内的异构分支。
+    #[test]
+    fn batch_kernel_matches_scalar_lane_bitwise() {
+        simd_runtime_generate!(
+            fn run() {
+                let width = S::Vf32::WIDTH;
+                let active_idx = (width / 2).min(width - 1);
+                let options = EnvelopeOptions::default();
+
+                let active_spawner = spawner::<S>(
+                    LoopMode::LoopSustain,
+                    Interpolator::Linear,
+                    true,
+                    options,
+                    0.4,
+                    100,
+                );
+                let silent_spawners = [
+                    spawner::<S>(
+                        LoopMode::LoopSustain,
+                        Interpolator::Nearest,
+                        true,
+                        options,
+                        0.0,
+                        100,
+                    ),
+                    spawner::<S>(
+                        LoopMode::LoopContinuous,
+                        Interpolator::Linear,
+                        true,
+                        options,
+                        0.0,
+                        80,
+                    ),
+                    spawner::<S>(
+                        LoopMode::NoLoop,
+                        Interpolator::Linear,
+                        true,
+                        options,
+                        0.0,
+                        60,
+                    ),
+                    spawner::<S>(
+                        LoopMode::OneShot,
+                        Interpolator::Nearest,
+                        true,
+                        options,
+                        0.0,
+                        40,
+                    ),
+                ];
+
+                let control = VoiceControlData::new_defaults();
+                let mut voices: Vec<Box<dyn Voice>> = (0..width)
+                    .map(|k| {
+                        if k == active_idx {
+                            active_spawner.begin_voice_impl(&control, true, false)
+                        } else {
+                            silent_spawners[k % silent_spawners.len()]
+                                .begin_voice_impl(&control, true, false)
+                        }
+                    })
+                    .collect();
+                // 参考 voice：同一参数、独立状态、只走标量 lane 渲染。
+                let mut reference = active_spawner.begin_voice_impl(&control, true, false);
+
+                let mut kernel_buf = vec![0.0f32; FRAMES * 2];
+                let mut scalar_buf = vec![0.0f32; FRAMES * 2];
+                for block in 0..10 {
+                    kernel_buf.fill(0.0);
+                    scalar_buf.fill(0.0);
+
+                    let mut lanes: Vec<&mut BatchLane> =
+                        voices.iter_mut().filter_map(|v| v.batch_lane()).collect();
+                    assert_eq!(lanes.len(), width);
+                    assert!(render_batch_chunk(&mut lanes, &mut kernel_buf, FRAMES));
+                    drop(lanes);
+
+                    reference
+                        .batch_lane()
+                        .expect("参考 voice 应为批 voice")
+                        .render_scalar(&mut scalar_buf);
+
+                    assert_eq!(
+                        kernel_buf, scalar_buf,
+                        "第 {block} 块内核与标量 lane 不一致（活跃下标 {active_idx}，宽度 {width}）"
+                    );
+                }
+            }
+        );
+
+        run();
+    }
+
+    /// 口径 3：8 lane 全活跃时，内核与逐 voice 顺序渲染的差异仅为混音求和顺序
+    /// （树形 vs 顺序）带来的 f32 舍入，必须在 1e-6 相对量级内，且 RMS 一致。
+    #[test]
+    fn batch_kernel_mixing_order_within_tolerance() {
+        simd_runtime_generate!(
+            fn run() {
+                let width = S::Vf32::WIDTH;
+                let options = EnvelopeOptions::default();
+                let s = spawner::<S>(
+                    LoopMode::LoopSustain,
+                    Interpolator::Linear,
+                    true,
+                    options,
+                    0.4,
+                    100,
+                );
+                let control = VoiceControlData::new_defaults();
+
+                let mut kernel_voices: Vec<Box<dyn Voice>> = (0..width)
+                    .map(|_| s.begin_voice_impl(&control, true, false))
+                    .collect();
+                let mut scalar_voices: Vec<Box<dyn Voice>> = (0..width)
+                    .map(|_| s.begin_voice_impl(&control, true, false))
+                    .collect();
+
+                let mut kernel_buf = vec![0.0f32; FRAMES * 2];
+                let mut scalar_buf = vec![0.0f32; FRAMES * 2];
+                for block in 0..6 {
+                    kernel_buf.fill(0.0);
+                    scalar_buf.fill(0.0);
+
+                    let mut lanes: Vec<&mut BatchLane> = kernel_voices
+                        .iter_mut()
+                        .filter_map(|v| v.batch_lane())
+                        .collect();
+                    assert_eq!(lanes.len(), width);
+                    assert!(render_batch_chunk(&mut lanes, &mut kernel_buf, FRAMES));
+                    drop(lanes);
+
+                    for voice in scalar_voices.iter_mut() {
+                        voice.render_to(&mut scalar_buf);
+                    }
+
+                    let mut max_diff = 0.0f32;
+                    let mut peak = 0.0f32;
+                    let mut energy_kernel = 0.0f64;
+                    let mut energy_scalar = 0.0f64;
+                    for (k, s) in kernel_buf.iter().zip(scalar_buf.iter()) {
+                        max_diff = max_diff.max((k - s).abs());
+                        peak = peak.max(s.abs());
+                        energy_kernel += (*k as f64) * (*k as f64);
+                        energy_scalar += (*s as f64) * (*s as f64);
+                    }
+                    let tolerance = 1e-6 + 1e-6 * peak;
+                    assert!(
+                        max_diff <= tolerance,
+                        "第 {block} 块混音顺序差异超容差: max_diff={max_diff} peak={peak}"
+                    );
+                    let rms_kernel = (energy_kernel / kernel_buf.len() as f64).sqrt();
+                    let rms_scalar = (energy_scalar / scalar_buf.len() as f64).sqrt();
+                    assert!(
+                        (rms_kernel - rms_scalar).abs() <= 1e-9 + 1e-6 * rms_scalar,
+                        "第 {block} 块 RMS 偏离: kernel={rms_kernel} scalar={rms_scalar}"
+                    );
+                }
+            }
+        );
+
+        run();
     }
 }

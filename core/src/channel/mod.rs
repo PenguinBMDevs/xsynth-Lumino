@@ -3,7 +3,7 @@ use std::sync::{atomic::AtomicU64, Arc};
 use crate::{
     effects::MultiChannelBiQuad,
     helpers::{prepapre_cache_vec, sum_simd},
-    voice::VoiceControlData,
+    voice::{BatchLane, Voice, VoiceControlData},
     AudioStreamParams, ChannelCount,
 };
 
@@ -229,6 +229,16 @@ impl VoiceChannel {
         // 3) 渲染（可并行）。
         out.fill(0.0);
         crate::profiling::tracy_zone!("channel_keys", {
+            // B1 批渲染：仅在单线程（无 key 级线程池）且立体声、SIMD 宽度足够时启用。
+            if self.batched_render_enabled() {
+                crate::profiling::tracy_zone!("ch_keys_render", {
+                    self.render_batched(out);
+                });
+                crate::profiling::tracy_zone!("channel_effects", {
+                    self.apply_channel_effects(out);
+                });
+                return;
+            }
             match self.threadpool.as_ref() {
                 Some(pool) => {
                     let len = out.len();
@@ -261,6 +271,64 @@ impl VoiceChannel {
         crate::profiling::tracy_zone!("channel_effects", {
             self.apply_channel_effects(out);
         });
+    }
+
+    /// B1 批渲染是否可用：`LUMINO_BATCH` 打开 + 无 key 级线程池（只有单线程渲染才能
+    /// 跨 key 收集连续的可批 lane）+ 立体声输出 + SIMD 宽度足够。
+    fn batched_render_enabled(&self) -> bool {
+        self.threadpool.is_none()
+            && self.stream_params.channels == ChannelCount::Stereo
+            && crate::voice::batching_supported()
+    }
+
+    /// 跨 key 批渲染。
+    ///
+    /// 遍历「key 顺序 → key 内 voice 顺序」的扁平序列（与 `LUMINO_BATCH=0` 的
+    /// 渲染顺序一致），把连续的可批 voice 按运行时 SIMD 宽度分块交给批内核；
+    /// 前导/后继/孤立（不足一个 chunk）的 voice 仍逐 voice 渲染，因此逐 voice
+    /// 的累加顺序不变（批内 lane 之间为树形求和，见 `voice/batch.rs`）。
+    fn render_batched(&mut self, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        let width = crate::voice::batch_chunk_width();
+        {
+            let mut all: Vec<&mut Box<dyn Voice>> = self
+                .key_voices
+                .iter_mut()
+                .flat_map(|key| key.data.iter_voices_mut())
+                .collect();
+            let mut i = 0usize;
+            while i < all.len() {
+                if all[i].batch_lane().is_none() {
+                    all[i].render_to(out);
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < all.len() && all[i].batch_lane().is_some() {
+                    i += 1;
+                }
+                let end = i;
+
+                let mut j = start;
+                while j + width <= end {
+                    if !render_voice_chunk(&mut all[j..j + width], out, frames) {
+                        for voice in all[j..j + width].iter_mut() {
+                            voice.render_to(out);
+                        }
+                    }
+                    j += width;
+                }
+                for voice in all[j..end].iter_mut() {
+                    voice.render_to(out);
+                }
+            }
+        }
+
+        for key in self.key_voices.iter_mut() {
+            if key.data.has_voices() {
+                key.data.remove_ended_voices();
+            }
+        }
     }
 
     /// 按分级策略抢占 `count` 个活跃声部（供跨通道全局治理调用）。
@@ -492,5 +560,232 @@ impl AudioPipe for VoiceChannel {
 
     fn read_samples_unchecked(&mut self, out: &mut [f32]) {
         self.push_key_events_and_render(out);
+    }
+}
+
+/// 把一个 chunk（恰好 SIMD 宽度个 voice）交给批内核。
+///
+/// 返回 `false` 表示不可批（存在非 lane voice，或 biquad 开关不一致导致无法整块
+/// 向量化），由调用方回退到逐 voice 渲染；回退不改变任何状态。
+fn render_voice_chunk(voices: &mut [&mut Box<dyn Voice>], out: &mut [f32], frames: usize) -> bool {
+    let mut lanes: Vec<&mut BatchLane> = Vec::with_capacity(voices.len());
+    for voice in voices.iter_mut() {
+        match voice.batch_lane() {
+            Some(lane) => lanes.push(lane),
+            None => return false,
+        }
+    }
+    let Some(first) = lanes.first() else {
+        return false;
+    };
+    let filter_enabled = first.filter_enabled();
+    if lanes
+        .iter()
+        .any(|lane| lane.filter_enabled() != filter_enabled)
+    {
+        return false;
+    }
+    crate::voice::render_batch_chunk(&mut lanes, out, frames)
+}
+
+#[cfg(test)]
+mod batch_render_tests {
+    //! B1 批渲染接线测试（`VoiceChannel::render_batched`）。
+    //!
+    //! 目标：验证「扁平 voice 序列 → 连续可批 run → 按 SIMD 宽度分块 → 尾部/非可批
+    //! voice 回退」的接线不丢 voice、不重复渲染，并与逐 voice 路径输出一致
+    //! （差异仅来自批内树形求和的 f32 舍入）。
+
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::*;
+    use crate::effects::{BiQuadFilter, FilterType};
+    use crate::voice::{
+        BatchLaneInit, EnvelopeDescriptor, ReleaseType, StereoBatchVoice, VoiceControlData,
+        VoiceGeneratorBase, VoiceSampleGenerator,
+    };
+    use xsynth_soundfonts::LoopMode;
+
+    const SR: u32 = 48_000;
+    const FRAMES: usize = 480;
+
+    /// 常量 voice：每帧给左右声道各加 `value`；统计 `render_to` 次数以验证
+    /// 「既不跳过也不重复渲染」。
+    struct ConstVoice {
+        value: f32,
+        renders: Arc<AtomicUsize>,
+    }
+
+    impl VoiceGeneratorBase for ConstVoice {
+        fn ended(&self) -> bool {
+            false
+        }
+        fn signal_release(&mut self, _rel_type: ReleaseType) {}
+        fn process_controls(&mut self, _control: &VoiceControlData) {}
+    }
+
+    impl VoiceSampleGenerator for ConstVoice {
+        fn render_to(&mut self, buffer: &mut [f32]) {
+            self.renders.fetch_add(1, Ordering::Relaxed);
+            for sample in buffer.iter_mut() {
+                *sample += self.value;
+            }
+        }
+    }
+
+    impl Voice for ConstVoice {
+        fn is_releasing(&self) -> bool {
+            false
+        }
+        fn is_killed(&self) -> bool {
+            false
+        }
+        fn velocity(&self) -> u8 {
+            100
+        }
+        fn exclusive_class(&self) -> Option<u8> {
+            None
+        }
+    }
+
+    fn batch_voice(amp: f32) -> Box<dyn Voice> {
+        let samples: Arc<[f32]> = (0..4_096)
+            .map(|i| (i as f32 * 0.01).sin() * 0.5)
+            .collect::<Vec<_>>()
+            .into();
+        let env = EnvelopeDescriptor {
+            start_percent: 0.0,
+            delay: 0.0,
+            attack: 0.01,
+            hold: 0.0,
+            decay: 0.3,
+            sustain_percent: 0.5,
+            release: 0.05,
+        }
+        .to_envelope_params(SR, Default::default());
+        let init = BatchLaneInit {
+            speed_mult: 1.0,
+            gain_l: amp,
+            gain_r: amp,
+            samples_l: samples.clone(),
+            samples_r: samples,
+            loop_mode: LoopMode::LoopSustain,
+            loop_offset: 0,
+            loop_start: 100,
+            loop_end: 3_000,
+            loop_stop: None,
+            interpolator: crate::soundfont::Interpolator::Nearest,
+            filter: Some(BiQuadFilter::new(
+                FilterType::LowPass,
+                9_000.0,
+                SR as f32,
+                Some(0.7),
+            )),
+            envelope: env,
+            sample_rate: SR as f32,
+            group_len: crate::voice::batch_chunk_width() as u8,
+            velocity: 100,
+            exclusive_class: None,
+        };
+        Box::new(StereoBatchVoice::new(
+            &init,
+            &VoiceControlData::new_defaults(),
+        ))
+    }
+
+    /// 构造一个带脚本化 voice 布局的通道：跨 key 的连续批 run、run 被非可批 voice
+    /// 打断、以及不足一个 chunk 的尾部。
+    fn build_channel(counters: &[Arc<AtomicUsize>]) -> VoiceChannel {
+        let mut channel = VoiceChannel::new(
+            ChannelInitOptions::default(),
+            AudioStreamParams::new(SR, ChannelCount::Stereo),
+            None,
+        );
+        // key 0：8 个可批（正好一个 chunk）
+        for _ in 0..8 {
+            channel.key_voices[0].data.push_voice_test(batch_voice(0.4));
+        }
+        // key 1：2 个可批 + 常量 voice（打断 run）+ 8 个可批
+        channel.key_voices[1].data.push_voice_test(batch_voice(0.4));
+        channel.key_voices[1].data.push_voice_test(batch_voice(0.4));
+        channel.key_voices[1]
+            .data
+            .push_voice_test(Box::new(ConstVoice {
+                value: 1.0,
+                renders: counters[0].clone(),
+            }));
+        for _ in 0..8 {
+            channel.key_voices[1]
+                .data
+                .push_voice_test(batch_voice(0.25));
+        }
+        // key 2：3 个可批（不足一个 chunk 的尾部）+ 常量 voice
+        for _ in 0..3 {
+            channel.key_voices[2].data.push_voice_test(batch_voice(0.3));
+        }
+        channel.key_voices[2]
+            .data
+            .push_voice_test(Box::new(ConstVoice {
+                value: 2.0,
+                renders: counters[1].clone(),
+            }));
+        channel
+    }
+
+    #[test]
+    fn render_batched_matches_per_voice_render_and_visits_every_voice() {
+        let batched_counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let scalar_counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let mut batched = build_channel(&batched_counters);
+        let mut scalar = build_channel(&scalar_counters);
+
+        let mut batched_buf = vec![0.0f32; FRAMES * 2];
+        let mut scalar_buf = vec![0.0f32; FRAMES * 2];
+
+        for block in 0..4 {
+            batched_buf.fill(0.0);
+            scalar_buf.fill(0.0);
+            batched.render_batched(&mut batched_buf);
+            for key in scalar.key_voices.iter_mut() {
+                key.data.render_to(&mut scalar_buf);
+            }
+
+            let mut max_diff = 0.0f32;
+            let mut peak = 0.0f32;
+            for (b, s) in batched_buf.iter().zip(scalar_buf.iter()) {
+                max_diff = max_diff.max((b - s).abs());
+                peak = peak.max(s.abs());
+            }
+            assert!(
+                max_diff <= 1e-5 + 1e-5 * peak,
+                "第 {block} 块批/逐 voice 输出差异超容差: max_diff={max_diff} peak={peak}"
+            );
+        }
+
+        // 每块恰好渲染一次：4 块 → 每个常量 voice 各 4 次。
+        for (i, counter) in batched_counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                4,
+                "批路径第 {i} 个非可批 voice 的渲染次数异常（跳过或重复）"
+            );
+        }
+        for (i, counter) in scalar_counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                4,
+                "标量路径第 {i} 个 voice 次数异常"
+            );
+        }
+
+        // 常量贡献必须完整出现在输出里（0.4/0.25/0.3 的批 voice 与之叠加，
+        // 用「去掉常量 voice 的通道」做差验证会更复杂，这里退而验证信号非零且量级正确）。
+        assert!(
+            batched_buf.iter().any(|s| s.abs() > 1.0),
+            "输出中应包含常量 voice 的贡献"
+        );
     }
 }

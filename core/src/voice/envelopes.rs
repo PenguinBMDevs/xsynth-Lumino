@@ -247,6 +247,72 @@ impl EnvelopeParameters {
     pub fn modify_stage_data(&mut self, part: usize, data: EnvelopePart) {
         self.parts[part] = data;
     }
+
+    /// 起始幅度（`Delay` 阶段之前的值），批处理 lane 复刻包络初态时需要。
+    #[inline(always)]
+    pub(crate) fn start_amplitude(&self) -> f32 {
+        self.start
+    }
+
+    /// 按 `EnvelopeControlData`（CC73/CC72 等）重新计算包络各阶段时长。
+    ///
+    /// 从 `SIMDVoiceEnvelope::get_modified_envelope` 抽出为与 SIMD 类型无关的
+    /// 实现：批处理 lane 没有 `S: Simd` 类型参数，但必须与逐 voice 路径使用
+    /// **同一份**时长计算逻辑（否则批路径与标量路径行为分叉）。
+    pub(crate) fn with_envelope_control(
+        &self,
+        envelope: EnvelopeControlData,
+        sample_rate: f32,
+    ) -> EnvelopeParameters {
+        fn calculate_curve(value: u8, duration: f32) -> f32 {
+            match value {
+                0..=64 => (value as f32 / 64.0).powi(5) * duration,
+                65..=128 => duration + ((value as f32 - 64.0) / 64.0).powi(3) * 15.0,
+                _ => duration,
+            }
+        }
+
+        let mut params = *self;
+
+        if let Some(attack) = envelope.attack {
+            let old_duration =
+                params.get_stage_duration(EnvelopeStage::Attack) as f32 / sample_rate;
+            let duration = (calculate_curve(attack, old_duration) * sample_rate) as u32;
+
+            let part = EnvelopeStage::Attack.as_usize();
+            match params.parts[part] {
+                EnvelopePart::Lerp {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp(target, duration)),
+                EnvelopePart::LerpConvex {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp_convex(target, duration)),
+                _ => {}
+            }
+        }
+        if let Some(release) = envelope.release {
+            let old_duration =
+                params.get_stage_duration(EnvelopeStage::Release) as f32 / sample_rate;
+            let duration = (calculate_curve(release, old_duration).max(0.02) * sample_rate) as u32;
+
+            let part = EnvelopeStage::Release.as_usize();
+            match params.parts[part] {
+                EnvelopePart::Lerp {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp(target, duration)),
+                EnvelopePart::LerpConcave {
+                    target,
+                    duration: _,
+                } => params.modify_stage_data(part, EnvelopePart::lerp_concave(target, duration)),
+                _ => {}
+            }
+        }
+
+        params
+    }
 }
 
 enum StageData<T: Simd> {
@@ -364,56 +430,11 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
     }
 
     pub fn get_modified_envelope(
-        mut params: EnvelopeParameters,
+        params: EnvelopeParameters,
         envelope: EnvelopeControlData,
         sample_rate: f32,
     ) -> EnvelopeParameters {
-        fn calculate_curve(value: u8, duration: f32) -> f32 {
-            match value {
-                0..=64 => (value as f32 / 64.0).powi(5) * duration,
-                65..=128 => duration + ((value as f32 - 64.0) / 64.0).powi(3) * 15.0,
-                _ => duration,
-            }
-        }
-
-        if let Some(attack) = envelope.attack {
-            let old_duration =
-                params.get_stage_duration(EnvelopeStage::Attack) as f32 / sample_rate;
-            let duration = (calculate_curve(attack, old_duration) * sample_rate) as u32;
-
-            let part = EnvelopeStage::Attack.as_usize();
-            match params.parts[part] {
-                EnvelopePart::Lerp {
-                    target,
-                    duration: _,
-                } => params.modify_stage_data(part, EnvelopePart::lerp(target, duration)),
-                EnvelopePart::LerpConvex {
-                    target,
-                    duration: _,
-                } => params.modify_stage_data(part, EnvelopePart::lerp_convex(target, duration)),
-                _ => {}
-            }
-        }
-        if let Some(release) = envelope.release {
-            let old_duration =
-                params.get_stage_duration(EnvelopeStage::Release) as f32 / sample_rate;
-            let duration = (calculate_curve(release, old_duration).max(0.02) * sample_rate) as u32;
-
-            let part = EnvelopeStage::Release.as_usize();
-            match params.parts[part] {
-                EnvelopePart::Lerp {
-                    target,
-                    duration: _,
-                } => params.modify_stage_data(part, EnvelopePart::lerp(target, duration)),
-                EnvelopePart::LerpConcave {
-                    target,
-                    duration: _,
-                } => params.modify_stage_data(part, EnvelopePart::lerp_concave(target, duration)),
-                _ => {}
-            }
-        }
-
-        params
+        params.with_envelope_control(envelope, sample_rate)
     }
 
     pub fn modify_envelope(&mut self, envelope: EnvelopeControlData) {

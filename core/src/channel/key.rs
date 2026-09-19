@@ -1,5 +1,7 @@
 use std::sync::{atomic::AtomicU64, Arc};
 
+use crate::voice::Voice;
+
 use super::{
     channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::StealTier,
     voice_buffer::VoiceBuffer, ChannelInitOptions, VoiceControlData,
@@ -66,6 +68,22 @@ impl KeyData {
             }
             self.voices.remove_ended_voices();
         }
+    }
+
+    /// 逐 voice 可变迭代（B1 批渲染需要跨 key 扁平遍历 voice 顺序）。
+    pub fn iter_voices_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn Voice>> {
+        self.voices.iter_voices_mut()
+    }
+
+    /// 移除已结束的 voice（批渲染在全部渲染完成后统一调用，语义同 `render_to` 尾部）。
+    pub fn remove_ended_voices(&mut self) {
+        self.voices.remove_ended_voices();
+    }
+
+    /// 测试专用：直接注入 voice（批渲染接线测试用；生产路径只经 `send_event`）。
+    #[cfg(test)]
+    pub(crate) fn push_voice_test(&mut self, voice: Box<dyn Voice>) {
+        self.voices.push_voices(std::iter::once(voice), None);
     }
 
     pub fn has_voices(&self) -> bool {
