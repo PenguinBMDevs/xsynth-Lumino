@@ -51,16 +51,21 @@ const MAX_LANES: usize = 16;
 /// 启用批渲染所需的最小 SIMD 宽度（更低宽度下跨 voice 并行收益不足）。
 const MIN_BATCH_WIDTH: usize = 8;
 
+/// 解析开关取值：**默认开**；`0` / `false`（不分大小写）关闭。
+///
+/// 非 UTF-8 取值按"未设置"处理（默认开），与历史行为一致。
+fn parse_batch_env(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
 /// 批处理开关：**默认开**；`LUMINO_BATCH=0` 或 `false`（不分大小写）显式关闭。
 ///
 /// 关闭用于 A/B 对照与出问题时的秒回退（进程内首次读取后缓存）。
 pub(crate) fn batch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("LUMINO_BATCH").is_none_or(|v| {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        })
+        let raw = std::env::var_os("LUMINO_BATCH");
+        parse_batch_env(raw.as_deref().and_then(|v| v.to_str()))
     })
 }
 
@@ -1509,5 +1514,26 @@ impl Voice for StereoBatchVoice {
     #[inline(always)]
     fn batch_lane(&mut self) -> Option<&mut BatchLane> {
         Some(&mut self.lane)
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::parse_batch_env;
+
+    /// 开关契约：**默认开（opt-out）**；仅 `0` / `false`（不分大小写）关闭。
+    ///
+    /// 这条契约是上线口径的一部分（`b0e54fb` 起默认开），改动它等于改产品行为，
+    /// 因此用测试钉住：未设置 = 开；"0"/"false"/"FALSE" = 关；其余 = 开。
+    #[test]
+    fn batch_env_is_opt_out() {
+        assert!(parse_batch_env(None), "未设置应为默认开");
+        assert!(parse_batch_env(Some("1")));
+        assert!(parse_batch_env(Some("true")));
+        assert!(parse_batch_env(Some("")));
+        assert!(!parse_batch_env(Some("0")));
+        assert!(!parse_batch_env(Some("false")));
+        assert!(!parse_batch_env(Some("FALSE")));
+        assert!(!parse_batch_env(Some("False")));
     }
 }
