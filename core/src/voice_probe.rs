@@ -117,7 +117,7 @@ mod imp {
     /// 是否对该 voice 采样（在 voice 创建时调用一次）。
     #[inline(always)]
     pub fn should_probe() -> bool {
-        enabled() && SEQ.fetch_add(1, Ordering::Relaxed) % stride() == 0
+        enabled() && SEQ.fetch_add(1, Ordering::Relaxed).is_multiple_of(stride())
     }
 
     /// rdtsc 计数刻度（x86_64；其他平台 `None`，探针自动静默）。

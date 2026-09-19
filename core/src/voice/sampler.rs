@@ -409,12 +409,6 @@ where
             _s: PhantomData,
         }
     }
-
-    fn increment_time(&mut self, by: f64) -> f64 {
-        let time = self.time;
-        self.time += by;
-        time
-    }
 }
 
 impl<S, Pitch, Grabber> VoiceGeneratorBase for SIMDStereoVoiceSampler<S, Pitch, Grabber>
@@ -459,16 +453,22 @@ where
             let mut indexes = S::Vi32::zeroes();
             let mut fractionals = S::Vf32::zeroes();
 
+            // 时间推进在局部 f64 中累加，循环结束再写回 `self.time`：
+            // 运算顺序与逐 lane `increment_time` 完全一致（逐位等价），
+            // 但省去每 lane 一次结构体读写。
+            let mut time = self.time;
             unsafe {
                 for i in 0..S::Vf32::WIDTH {
-                    let time = self.increment_time(speed.get_unchecked(i) as f64);
+                    let t = time;
+                    time += speed.get_unchecked(i) as f64;
                     // `time % 1.0` 会为每个样本触发 fmod 库调用；改用「截断整数 + 差值」：
                     // 对 0 ≤ time < 2^31 与 fmod 结果逐位等价（两者都是精确运算）。
-                    let index = time as i32;
+                    let index = t as i32;
                     *indexes.get_unchecked_mut(i) = index;
-                    *fractionals.get_unchecked_mut(i) = (time - index as f64) as f32;
+                    *fractionals.get_unchecked_mut(i) = (t - index as f64) as f32;
                 }
             }
+            self.time = time;
 
             crate::voice_probe::sampler_mark(&mut marks, 2);
             let left = self.grabber_left.get(indexes, fractionals);
@@ -494,7 +494,7 @@ mod tests {
             let slow = (t % 1.0) as f32;
             assert_eq!(fast, slow, "t={t}");
             t += step;
-            step = 0.1 + (step * 1.618_033_9) % 1.0;
+            step = 0.1 + (step * std::f64::consts::GOLDEN_RATIO) % 1.0;
             checks += 1;
         }
         assert!(checks > 100_000, "采样点太少: {checks}");

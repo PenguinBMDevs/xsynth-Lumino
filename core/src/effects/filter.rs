@@ -112,6 +112,9 @@ pub struct MultiChannelBiQuad {
     value: ValueLerp,
     q: Option<f32>,
     sample_rate: f32,
+    /// 当前已生效系数的输入键 `(freq_bits, q_bits, fil_type)`：
+    /// 仅当输入变化时才重算系数（`get_coeffs` 含三角函数，逐帧重算是纯浪费）。
+    cached: Option<(u32, Option<u32>, FilterType)>,
 }
 
 impl MultiChannelBiQuad {
@@ -138,21 +141,31 @@ impl MultiChannelBiQuad {
             value: ValueLerp::new(freq, sample_rate as u32),
             q,
             sample_rate,
+            cached: None,
         }
     }
 
     /// Changes the type of the audio filter.
     pub fn set_filter_type(&mut self, fil_type: FilterType, freq: f32, q: Option<f32>) {
         self.value.set_end(freq);
+        // 类型/Q 变化必须失效系数缓存（频率由 `set_coefficients` 按键比较处理）。
+        if self.fil_type != fil_type || self.q != q {
+            self.cached = None;
+        }
         self.fil_type = fil_type;
         self.q = q;
     }
 
     fn set_coefficients(&mut self, freq: f32, q: Option<f32>) {
+        let key = (freq.to_bits(), q.map(f32::to_bits), self.fil_type);
+        if self.cached == Some(key) {
+            return;
+        }
         let coeffs = BiQuadFilter::get_coeffs(self.fil_type, freq, self.sample_rate, q);
         for filter in self.channels.iter_mut() {
             filter.set_coefficients(coeffs);
         }
+        self.cached = Some(key);
     }
 
     /// Filters the audio of the given sample buffer.

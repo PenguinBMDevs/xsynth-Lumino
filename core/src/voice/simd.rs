@@ -192,6 +192,58 @@ where
 /// Parent struct for base SIMD voice combination functions
 pub struct VoiceCombineSIMD<T: Simd>(PhantomData<T>);
 
+/// 常量 × 单值控制生成器（pitch multiplier 专用）。
+///
+/// 语义等价于 `VoiceCombineSIMD::mult(SIMDConstant, SIMDVoiceControl)`：
+/// 每个 lane 的值都是 `base * control_value`。区别只在结构——组合链上少一层
+/// 嵌套的 `next_sample`（原实现每 8 帧要走两层生成器 + 一次 SIMD 乘）。
+///
+/// 逐位等价性：原路径为 `set1(base) * set1(value)`（逐 lane 一次 f32 乘法），
+/// 本实现标量先乘再广播，操作数与舍入完全一致。
+pub struct SIMDConstantControl<S: Simd> {
+    base: f32,
+    value: f32,
+    update: fn(&VoiceControlData) -> f32,
+    _s: PhantomData<S>,
+}
+
+impl<S: Simd> SIMDConstantControl<S> {
+    pub fn new(
+        base: f32,
+        control: &VoiceControlData,
+        update: fn(&VoiceControlData) -> f32,
+    ) -> SIMDConstantControl<S> {
+        SIMDConstantControl {
+            base,
+            value: (update)(control),
+            update,
+            _s: PhantomData,
+        }
+    }
+}
+
+impl<S: Simd> VoiceGeneratorBase for SIMDConstantControl<S> {
+    #[inline(always)]
+    fn ended(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn signal_release(&mut self, _rel_type: ReleaseType) {}
+
+    #[inline(always)]
+    fn process_controls(&mut self, control: &VoiceControlData) {
+        self.value = (self.update)(control);
+    }
+}
+
+impl<S: Simd> SIMDVoiceGenerator<S, SIMDSampleMono<S>> for SIMDConstantControl<S> {
+    #[inline(always)]
+    fn next_sample(&mut self) -> SIMDSampleMono<S> {
+        simd_invoke!(S, SIMDSampleMono(S::Vf32::set1(self.base * self.value)))
+    }
+}
+
 impl<T: Simd> VoiceCombineSIMD<T> {
     pub fn mult<TI, TO, V1, V2>(voice1: V1, voice2: V2) -> impl SIMDVoiceGenerator<T, TO>
     where

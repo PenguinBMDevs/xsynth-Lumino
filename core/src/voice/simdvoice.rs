@@ -85,7 +85,11 @@ where
             //    每帧的 `remainder_pos == width` 分支也一并消除。
             while i + 2 * width <= len {
                 #[cfg(feature = "voice_probe")]
-                let chain_t0 = crate::voice_probe::tick();
+                let chain_t0 = if self.probe {
+                    crate::voice_probe::tick()
+                } else {
+                    None
+                };
                 self.remainder = self.generator.next_sample();
                 #[cfg(feature = "voice_probe")]
                 if let Some(t0) = chain_t0 {
@@ -110,7 +114,11 @@ where
             while i + 1 < len {
                 if self.remainder_pos == width {
                     #[cfg(feature = "voice_probe")]
-                    let chain_t0 = crate::voice_probe::tick();
+                    let chain_t0 = if self.probe {
+                        crate::voice_probe::tick()
+                    } else {
+                        None
+                    };
                     self.remainder = self.generator.next_sample();
                     #[cfg(feature = "voice_probe")]
                     if let Some(t0) = chain_t0 {

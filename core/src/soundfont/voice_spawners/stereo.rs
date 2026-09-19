@@ -13,10 +13,10 @@ use crate::{
 use crate::{
     voice::VoiceControlData,
     voice::{
-        BufferSamplers, EnvelopeParameters, SIMDConstant, SIMDConstantStereo,
+        BufferSamplers, EnvelopeParameters, SIMDConstantControl, SIMDConstantStereo,
         SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
-        SIMDVoiceControl, SIMDVoiceEnvelope, SampleReader, SampleReaderLoop,
-        SampleReaderLoopSustain, SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
+        SIMDVoiceEnvelope, SampleReader, SampleReaderLoop, SampleReaderLoopSustain,
+        SampleReaderNoLoop, Voice, VoiceBase, VoiceCombineSIMD,
     },
 };
 
@@ -166,10 +166,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         &self,
         control: &VoiceControlData,
     ) -> impl SIMDVoiceGenerator<S, SIMDSampleMono<S>> {
-        let pitch_fac = SIMDConstant::<S>::new(self.speed_mult);
-        let pitch_multiplier = SIMDVoiceControl::new(control, |vc| vc.voice_pitch_multiplier);
-        let pitch_fac = VoiceCombineSIMD::mult(pitch_fac, pitch_multiplier);
-        pitch_fac
+        // 单层「常量 × 控制值」生成器：等价语义，组合链上少一层 next_sample。
+        SIMDConstantControl::<S>::new(self.speed_mult, control, |vc| vc.voice_pitch_multiplier)
     }
 
     fn apply_envelope<Gen, Sample>(
