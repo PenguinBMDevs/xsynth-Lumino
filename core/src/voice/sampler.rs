@@ -438,7 +438,12 @@ where
     Pitch: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
     Grabber: SIMDSampleGrabber<S>,
 {
-    pub fn new(grabber_left: Grabber, grabber_right: Grabber, pitch_gen: Pitch, probe: bool) -> Self {
+    pub fn new(
+        grabber_left: Grabber,
+        grabber_right: Grabber,
+        pitch_gen: Pitch,
+        probe: bool,
+    ) -> Self {
         SIMDStereoVoiceSampler {
             grabber_left,
             grabber_right,

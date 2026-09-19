@@ -325,6 +325,14 @@ impl RealtimeSynth {
         let sample_rate = stream_config.sample_rate().0;
         let stream_params = AudioStreamParams::new(sample_rate, stream_config.channels().into());
         let channel_pool = build_channel_pool(config.multithreading)?;
+        // B1 批渲染闸门：只有「通道内不启用 key 级线程池」时才允许批渲染。
+        // 否则会出现「spawner 造了批 voice、但通道无法批渲染 → 退回逐帧标量 lane」
+        // 的错配（标量 lane 比原 SIMD 链慢）。`ThreadCount::None` 是绝大多数机器
+        // （逻辑核 ≤ 16）的默认策略，此时启用批渲染。
+        xsynth_core::voice::set_batch_render_available(matches!(
+            config.multithreading,
+            ThreadCount::None
+        ));
         let channel_count = channel_count(config.format);
 
         // 每通道音频域混音状态（增益/声像），索引 = MIDI 通道号。
@@ -1163,9 +1171,8 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
                 output_vec.resize(data.len(), 0.0);
 
                 // 分离「等锁 / 读缓冲 / 限幅+写出」三段，用于定位回调内阻塞点。
-                let mut guard = crate::profiling::tracy_zone!("audio_lock", {
-                    buffered.lock().unwrap()
-                });
+                let mut guard =
+                    crate::profiling::tracy_zone!("audio_lock", { buffered.lock().unwrap() });
                 crate::profiling::tracy_zone!("audio_read", {
                     guard.read(&mut output_vec);
                 });

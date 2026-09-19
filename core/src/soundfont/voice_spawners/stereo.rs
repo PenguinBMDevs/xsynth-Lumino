@@ -103,7 +103,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         self.make_sample_reader(control, |s| BufferSamplers::new_f32(s), probe)
     }
 
-    /// B1：构造可批 voice。`LUMINO_BATCH` 关闭或 SIMD 宽度不足时返回 `None`（走原链路）。
+    /// B1：构造可批 voice。`LUMINO_BATCH=0`、宿主闸门关闭或 SIMD 宽度不足时
+    /// 返回 `None`（走原链路）。
     fn make_batch_voice(&self, control: &VoiceControlData) -> Option<Box<dyn Voice>> {
         if self.samples.len() < 2 {
             return None;
@@ -169,11 +170,9 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
                 |s| SIMDNearestSampleGrabber::new(make_bs(s)),
                 probe,
             ),
-            Interpolator::Linear => self.generate_sampler(
-                control,
-                |s| SIMDLinearSampleGrabber::new(make_bs(s)),
-                probe,
-            ),
+            Interpolator::Linear => {
+                self.generate_sampler(control, |s| SIMDLinearSampleGrabber::new(make_bs(s)), probe)
+            }
         }
     }
 

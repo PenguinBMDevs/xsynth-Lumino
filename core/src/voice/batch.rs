@@ -25,8 +25,14 @@
 //!
 //! # 开关
 //!
-//! `LUMINO_BATCH=1`（默认关）。关闭时 spawner 走原链路，渲染路径完全不变。
+//! **默认开**：`LUMINO_BATCH=0`（或 `false`）可显式关闭，用于 A/B 与秒回退。
+//! 关闭时 spawner 走原链路，渲染路径完全不变。
+//!
+//! 另有进程级闸门 `set_batch_render_available(false)`：由宿主（如 realtime 后端）
+//! 在「通道带 key 级线程池」时关闭，避免出现「spawner 造了批 voice、但通道无法批渲染
+//! → 退回逐帧标量 lane（比原 SIMD 链慢）」的错配。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use simdeez::prelude::*;
@@ -45,15 +51,35 @@ const MAX_LANES: usize = 16;
 /// 启用批渲染所需的最小 SIMD 宽度（更低宽度下跨 voice 并行收益不足）。
 const MIN_BATCH_WIDTH: usize = 8;
 
-/// 批处理开关：`LUMINO_BATCH` 存在且不为 `0`/`false` 时启用（默认关）。
+/// 批处理开关：**默认开**；`LUMINO_BATCH=0` 或 `false`（不分大小写）显式关闭。
+///
+/// 关闭用于 A/B 对照与出问题时的秒回退（进程内首次读取后缓存）。
 pub(crate) fn batch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("LUMINO_BATCH").is_some_and(|v| {
+        std::env::var_os("LUMINO_BATCH").is_none_or(|v| {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         })
     })
+}
+
+/// 进程级「批渲染可用」闸门（默认 `true`）。
+static RENDER_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+/// 由宿主设置批渲染是否可用。默认 `true`；当通道使用 key 级线程池
+/// （`ParallelismOptions::key != None`，即每通道内部再并行）时应设为 `false`：
+/// 此时 `VoiceChannel` 不会走批渲染，spawner 也不应再构造批 voice，
+/// 否则批 voice 会退回逐帧标量 lane（比原 SIMD 链慢）。
+///
+/// 注意：进程级生效（最后一次设置获胜）；运行中变更只影响此后 spawn 的 voice。
+pub fn set_batch_render_available(available: bool) {
+    RENDER_AVAILABLE.store(available, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn batch_render_available() -> bool {
+    RENDER_AVAILABLE.load(Ordering::Relaxed)
 }
 
 /// 运行时 SIMD 宽度 = 一个 batch chunk 的 lane 数（本机 AVX2 = 8）。
@@ -69,9 +95,9 @@ pub(crate) fn batch_chunk_width() -> usize {
     })
 }
 
-/// 批渲染是否可用：开关打开 + SIMD 宽度足够。
+/// 批渲染是否可用：开关打开（默认）+ 宿主闸门允许 + SIMD 宽度足够。
 pub(crate) fn batching_supported() -> bool {
-    batch_enabled() && batch_chunk_width() >= MIN_BATCH_WIDTH
+    batch_enabled() && batch_render_available() && batch_chunk_width() >= MIN_BATCH_WIDTH
 }
 
 /// spawn 期传入的静态参数（由 `StereoSampledVoiceSpawner` 填充）。

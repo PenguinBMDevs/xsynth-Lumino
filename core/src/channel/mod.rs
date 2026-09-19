@@ -279,7 +279,7 @@ impl VoiceChannel {
         });
     }
 
-    /// B1 批渲染是否可用：`LUMINO_BATCH` 打开 + 无 key 级线程池（只有单线程渲染才能
+    /// B1 批渲染是否可用：`LUMINO_BATCH`（默认开）+ 无 key 级线程池（只有单线程渲染才能
     /// 跨 key 收集连续的可批 lane）+ 立体声输出 + SIMD 宽度足够。
     fn batched_render_enabled(&self) -> bool {
         self.threadpool.is_none()
@@ -482,7 +482,8 @@ impl VoiceChannel {
             .sum()
     }
 
-    fn propagate_voice_controls(&mut self) {        for key in self.key_voices.iter_mut() {
+    fn propagate_voice_controls(&mut self) {
+        for key in self.key_voices.iter_mut() {
             key.data.process_controls(&self.voice_control_data);
         }
     }

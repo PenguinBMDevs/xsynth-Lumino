@@ -11,11 +11,13 @@ mod simdvoice;
 pub(crate) use simdvoice::*;
 
 pub mod batch;
+/// 宿主闸门：通道使用 key 级线程池时应设为 `false`（见 `batch` 模块文档）。
+pub use batch::set_batch_render_available;
 pub use batch::BatchLane;
 #[allow(unused_imports)]
 pub(crate) use batch::{
-    BatchLaneInit, StereoBatchVoice, batch_chunk_width, batching_supported, render_batch_chunk,
-    render_batch_chunk_mode,
+    batch_chunk_width, batching_supported, render_batch_chunk, render_batch_chunk_mode,
+    BatchLaneInit, StereoBatchVoice,
 };
 
 #[cfg(test)]
