@@ -3,7 +3,7 @@ use std::{
     io,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread::{self},
     time::Instant,
@@ -107,12 +107,32 @@ pub enum StreamRestartError {
 #[derive(Debug, Clone)]
 struct RealtimeSynthStats {
     voice_count: Arc<AtomicU64>,
+
+    /// 每通道事件队列的**当前深度**（取最后采样值；单位：未消费事件数）。
+    ///
+    /// 用途：让"生产者是否快于消费者"从不可见变为可测量。正常播放时是个位数~几十；
+    /// 持续上涨即说明接入侧已经跟不上（见 `docs` 中关于接入上限的说明）。
+    event_queue_depth: Arc<AtomicI64>,
+
+    /// 每通道事件队列深度的**高水位**（自启动以来最大值）。
+    ///
+    /// 这是判断"无界队列是否会撑爆内存"的直接指标：高水位 × 单事件大小 ≈ 峰值占用。
+    event_queue_high_water: Arc<AtomicI64>,
+
+    /// 被"丢弃"的 NoteOn 总数（紧急模式直接丢弃 + 队列冲洗丢弃）。
+    ///
+    /// 保命闸关闭且未进入紧急模式时恒为 0——即"无丢音"。此前这条路径完全静默，
+    /// 无法判断洪峰期间到底丢了多少；现在可测。
+    emergency_dropped_notes: Arc<AtomicU64>,
 }
 
 impl RealtimeSynthStats {
     pub fn new() -> RealtimeSynthStats {
         RealtimeSynthStats {
             voice_count: Arc::new(AtomicU64::new(0)),
+            event_queue_depth: Arc::new(AtomicI64::new(0)),
+            event_queue_high_water: Arc::new(AtomicI64::new(0)),
+            emergency_dropped_notes: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -139,6 +159,23 @@ impl RealtimeSynthStatsReader {
         self.stats.voice_count.load(Ordering::Relaxed)
     }
 
+    /// 事件队列当前深度（跨通道取最后采样值，单位：事件数）。
+    pub fn event_queue_depth(&self) -> i64 {
+        self.stats.event_queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// 事件队列深度高水位（自启动以来跨通道最大值，单位：事件数）。
+    pub fn event_queue_high_water(&self) -> i64 {
+        self.stats.event_queue_high_water.load(Ordering::Relaxed)
+    }
+
+    /// 被丢弃的 NoteOn 总数（紧急模式直接丢弃 + 队列冲洗丢弃）。
+    ///
+    /// 保命闸关闭且未进入紧急模式时恒为 0。
+    pub fn emergency_dropped_notes(&self) -> u64 {
+        self.stats.emergency_dropped_notes.load(Ordering::Relaxed)
+    }
+
     /// Returns the statistics of the buffered renderer used.
     ///
     /// See the BufferedRendererStatsReader documentation for more information.
@@ -148,7 +185,7 @@ impl RealtimeSynthStatsReader {
 }
 
 struct RealtimeSynthThreadSharedData {
-    buffered_renderer: Arc<Mutex<BufferedRenderer>>,
+    buffered_renderer: Arc<BufferedRenderer>,
 
     stream_control: crossbeam_channel::Sender<StreamCommand>,
 
@@ -350,6 +387,7 @@ impl RealtimeSynth {
         // 主输出实时响度峰值（与通道峰值同语义），由渲染管线汇总后写入。
         let master_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
+        let stats = RealtimeSynthStats::new();
         let PreparedRealtimeChannels {
             channel_stats,
             senders,
@@ -366,9 +404,11 @@ impl RealtimeSynth {
             channel_pool,
             config.format,
             channel_mix.clone(),
+            stats.event_queue_depth.clone(),
+            stats.event_queue_high_water.clone(),
+            stats.emergency_dropped_notes.clone(),
         )?;
 
-        let stats = RealtimeSynthStats::new();
         // 硬上限（量程）：`None`/`0` 为自动模式，使用默认 10000。
         let hard_max_voices = match config.global_max_voices {
             Some(n) if n > 0 => n,
@@ -394,10 +434,10 @@ impl RealtimeSynth {
         let render_size = calculate_render_size(sample_rate, config.render_window_ms).max(1);
         let cushion_samples =
             calculate_render_size(sample_rate, config.cushion_ms).max(render_size);
-        let buffered = Arc::new(Mutex::new(
+        let buffered = Arc::new(
             BufferedRenderer::new(render, stream_params, render_size, cushion_samples)
                 .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
-        ));
+        );
         let (stream_control, stream_owner, recovery_rx) =
             spawn_stream_thread(device.clone(), stream_config, buffered.clone())?;
 
@@ -468,7 +508,7 @@ impl RealtimeSynth {
     /// on how to use.
     pub fn get_stats(&self) -> RealtimeSynthStatsReader {
         let data = self.data.as_ref().unwrap();
-        let buffered_stats = data.buffered_renderer.lock().unwrap().get_buffer_stats();
+        let buffered_stats = data.buffered_renderer.get_buffer_stats();
 
         RealtimeSynthStatsReader::new(self.stats.clone(), buffered_stats)
     }
@@ -550,7 +590,7 @@ impl RealtimeSynth {
         let data = self.data.as_ref().unwrap();
         let sample_rate = self.stream_params.sample_rate;
         let size = calculate_render_size(sample_rate, render_window_ms);
-        data.buffered_renderer.lock().unwrap().set_render_size(size);
+        data.buffered_renderer.set_render_size(size);
     }
 
     /// 将音频流重定向到系统默认输出设备（合成管线保持不变）。
@@ -610,6 +650,9 @@ fn prepare_channels(
     channel_pool: Option<Arc<rayon::ThreadPool>>,
     format: SynthFormat,
     channel_mix: Arc<Vec<ChannelMix>>,
+    event_queue_depth: Arc<AtomicI64>,
+    event_queue_high_water: Arc<AtomicI64>,
+    emergency_dropped_notes: Arc<AtomicU64>,
 ) -> Result<PreparedRealtimeChannels, RealtimeSynthError> {
     let (output_sender, output_receiver) = bounded::<Vec<f32>>(channel_count as usize);
 
@@ -645,6 +688,9 @@ fn prepare_channels(
             admission_budget.clone(),
             emergency.clone(),
             flush_epoch.clone(),
+            event_queue_depth.clone(),
+            event_queue_high_water.clone(),
+            emergency_dropped_notes.clone(),
         )?;
         join_handles.push(join_handle);
     }
@@ -677,6 +723,9 @@ fn spawn_channel_thread(
     admission_budget: Arc<AtomicI64>,
     emergency: Arc<AtomicBool>,
     flush_epoch: Arc<AtomicU64>,
+    event_queue_depth: Arc<AtomicI64>,
+    event_queue_high_water: Arc<AtomicI64>,
+    emergency_dropped_notes: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -718,6 +767,13 @@ fn spawn_channel_thread(
                          sounding: &mut [u32; 128],
                          dropped: &mut [u32; 128],
                          seen_epoch: &mut u64| {
+                // 队列深度观测（每 admit 一次，2 次/块）：让"生产者是否快于消费者"
+                // 成为可测量指标。这是**唯一**能看见无界队列真相的地方——生产侧
+                // 只会闷头 send，消费侧此前不留任何痕迹。
+                let queued = event_receiver.len() as i64;
+                event_queue_depth.store(queued, Ordering::Relaxed);
+                event_queue_high_water.fetch_max(queued, Ordering::Relaxed);
+
                 // 冲洗纪元变化（紧急模式进入/退出）：整队列丢弃残留 NoteOn，
                 // NoteOff 按配对计数取消，其余事件直通。最多 16384/次，
                 // 未清完下次继续（seen_epoch 未推进）。
@@ -733,6 +789,7 @@ fn spawn_channel_thread(
                         match event {
                             ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, .. }) => {
                                 dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                                emergency_dropped_notes.fetch_add(1, Ordering::Relaxed);
                             }
                             ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
                                 let k = key as usize;
@@ -769,6 +826,7 @@ fn spawn_channel_thread(
                         ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
                             if emergency_now {
                                 dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                                emergency_dropped_notes.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 if !try_acquire(&admission_budget) {
                                     // 预算耗尽：抢一个最不重要的旧声部再发声，
@@ -1083,7 +1141,7 @@ fn build_render_pipe(
 fn build_output_stream(
     device: &Device,
     stream_config: SupportedStreamConfig,
-    buffered: Arc<Mutex<BufferedRenderer>>,
+    buffered: Arc<BufferedRenderer>,
     restart_notify: crossbeam_channel::Sender<StreamCommand>,
 ) -> Result<Stream, RealtimeSynthError> {
     match stream_config.sample_format() {
@@ -1147,7 +1205,7 @@ mod thread_cpu_cycles {
 fn build_output_stream_for<T: SizedSample + ConvertSample>(
     device: &Device,
     stream_config: SupportedStreamConfig,
-    buffered: Arc<Mutex<BufferedRenderer>>,
+    buffered: Arc<BufferedRenderer>,
     restart_notify: crossbeam_channel::Sender<StreamCommand>,
 ) -> Result<Stream, RealtimeSynthError> {
     let err_fn = move |err| {
@@ -1163,12 +1221,14 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
     let mut output_vec = Vec::new();
     let mut limiter = VolumeLimiter::new(stream_config.channels());
 
+    // 播放消费端：**独占** move 进回调闭包（FnMut），音频线程上不存在任何锁。
+    // 这是 `771beda`「音频回调不再阻塞」的收口——不仅不阻塞，也不再持锁，
+    // 因此非实时线程（UI 读统计 / 改缓冲大小）在结构上不可能阻塞音频线程。
+    let mut reader = buffered.reader();
+
     // 采样缓冲余量读数（获取一次即可，回调内无锁读取，用于观察缓冲是否被抽干）。
     #[cfg(feature = "tracy")]
-    let buffer_stats = {
-        let guard = buffered.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_buffer_stats()
-    };
+    let buffer_stats = buffered.get_buffer_stats();
 
     Ok(device.build_output_stream(
         &stream_config.into(),
@@ -1181,13 +1241,10 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
             crate::profiling::tracy_zone!("audio_callback", {
                 output_vec.resize(data.len(), 0.0);
 
-                // 分离「等锁 / 读缓冲 / 限幅+写出」三段，用于定位回调内阻塞点。
-                let mut guard =
-                    crate::profiling::tracy_zone!("audio_lock", { buffered.lock().unwrap() });
+                // 无锁：直接读自己独占持有的消费端。
                 crate::profiling::tracy_zone!("audio_read", {
-                    guard.read(&mut output_vec);
+                    reader.read(&mut output_vec);
                 });
-                drop(guard);
 
                 crate::profiling::tracy_zone!("audio_limit", {
                     for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
@@ -1222,7 +1279,7 @@ fn build_output_stream_for<T: SizedSample + ConvertSample>(
 fn spawn_stream_thread(
     device: Device,
     stream_config: SupportedStreamConfig,
-    buffered: Arc<Mutex<BufferedRenderer>>,
+    buffered: Arc<BufferedRenderer>,
 ) -> Result<
     (
         crossbeam_channel::Sender<StreamCommand>,
@@ -1316,7 +1373,7 @@ fn spawn_stream_thread(
 fn restart_stream(
     stream: &mut Stream,
     old_config: &SupportedStreamConfig,
-    buffered: &Arc<Mutex<BufferedRenderer>>,
+    buffered: &Arc<BufferedRenderer>,
     restart_notify: &crossbeam_channel::Sender<StreamCommand>,
 ) -> Result<(), StreamRestartError> {
     let host = cpal::default_host();

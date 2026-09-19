@@ -116,14 +116,15 @@ impl BufferedRendererStatsReader {
 /// while allowing more time to render per sample.
 ///
 /// Designed to be used in realtime playback only.
+///
+/// **线程模型（RT 安全契约）**：本结构体是**控制侧**句柄，只被非实时线程使用
+/// （构造、读取统计、改渲染块大小、关机）。播放消费端在 [`BufferedRendererReader`] 里，
+/// 由音频回调独占持有 —— 音频线程上**不存在任何互斥量**。
 pub struct BufferedRenderer {
     stats: BufferedRendererStats,
 
-    /// The receiver for samples (the render thread has the sender).
+    /// 仅用于派生 [`BufferedRendererReader`]（`Receiver` 的克隆是同一通道的另一个句柄）。
     receive: Receiver<Vec<f32>>,
-
-    /// Remainder of samples from the last received samples vec.
-    remainder: Vec<f32>,
 
     /// Whether the render thread should be killed.
     killed: Arc<AtomicBool>,
@@ -132,6 +133,74 @@ pub struct BufferedRenderer {
     thread_handle: Option<JoinHandle<()>>,
 
     stream_params: AudioStreamParams,
+}
+
+/// 播放消费端：独占读取队列与余量缓冲，供音频回调持有。
+///
+/// 它被 `move` 进 cpal 的回调闭包（`FnMut`），因此回调可以直接可变访问，
+/// **不需要锁、也不需要 `Arc`** —— 这正是"音频回调不阻塞/不持锁"的收口。
+///
+/// 每次构建音频流时用 [`BufferedRenderer::reader`] 派生一个新的 reader；
+/// 重启流（设备热插拔）时旧 reader 随旧流一起析构，新流拿到新 reader。
+pub struct BufferedRendererReader {
+    /// The receiver for samples (the render thread has the sender).
+    receive: Receiver<Vec<f32>>,
+
+    /// Remainder of samples from the last received samples vec.
+    remainder: Vec<f32>,
+
+    stats: BufferedRendererStats,
+
+    stream_params: AudioStreamParams,
+}
+
+impl BufferedRendererReader {
+    /// Reads samples from the remainder and the output queue into the destination array.
+    pub fn read(&mut self, dest: &mut [f32]) {
+        dest.fill(0.0);
+
+        let mut i: usize = 0;
+        let len = dest.len().min(self.remainder.len());
+
+        self.stats
+            .last_request_samples
+            .store(dest.len() as i64, Ordering::SeqCst);
+
+        // Read from current remainder
+        for r in self.remainder.drain(0..len) {
+            dest[i] = r;
+            i += 1;
+        }
+
+        // Read from output queue, leave the remainder if there is any.
+        // Never block the audio callback: if the queue is temporarily empty
+        // (render thread preempted / slow block), leave the rest as silence
+        // and let the next callback continue from the queue. Blocking here
+        // would stall the OS audio thread and cause glitches.
+        while self.remainder.is_empty() {
+            let mut buf = match self.receive.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => break,
+            };
+
+            let len = buf.len().min(dest.len() - i);
+            for r in buf.drain(0..len) {
+                dest[i] = r;
+                i += 1;
+            }
+
+            self.remainder = buf;
+        }
+
+        // Only subtract what was actually consumed: on an underrun the
+        // remaining destination is silence, not queued samples, so charging
+        // the full request would make `samples` drift permanently negative
+        // and corrupt the render thread's cushion check.
+        let samples = self.stats.samples.fetch_sub(i as i64, Ordering::SeqCst);
+        self.stats
+            .last_samples_after_read
+            .store(samples, Ordering::Relaxed);
+    }
 }
 
 impl BufferedRenderer {
@@ -271,67 +340,41 @@ impl BufferedRenderer {
                 last_samples_after_read,
             },
             receive: rx,
-            remainder: Vec::new(),
             stream_params,
             thread_handle: Some(thread_handle),
             killed,
         })
     }
 
-    /// Reads samples from the remainder and the output queue into the destination array.
-    pub fn read(&mut self, dest: &mut [f32]) {
-        dest.fill(0.0);
-
-        let mut i: usize = 0;
-        let len = dest.len().min(self.remainder.len());
-
-        self.stats
-            .last_request_samples
-            .store(dest.len() as i64, Ordering::SeqCst);
-
-        // Read from current remainder
-        for r in self.remainder.drain(0..len) {
-            dest[i] = r;
-            i += 1;
+    /// 派生一个播放消费端（供音频回调独占持有）。
+    ///
+    /// `Receiver` 的克隆是同一通道的另一个句柄；正常情况同一时刻只有一个活跃的
+    /// reader（重启流时旧流先析构），与历史"共享 `BufferedRenderer`"的语义一致。
+    pub fn reader(&self) -> BufferedRendererReader {
+        BufferedRendererReader {
+            receive: self.receive.clone(),
+            remainder: Vec::new(),
+            stats: self.stats.clone(),
+            stream_params: self.stream_params,
         }
+    }
 
-        // Read from output queue, leave the remainder if there is any.
-        // Never block the audio callback: if the queue is temporarily empty
-        // (render thread preempted / slow block), leave the rest as silence
-        // and let the next callback continue from the queue. Blocking here
-        // would stall the OS audio thread and cause glitches.
-        while self.remainder.is_empty() {
-            let mut buf = match self.receive.try_recv() {
-                Ok(buf) => buf,
-                Err(_) => break,
-            };
-
-            let len = buf.len().min(dest.len() - i);
-            for r in buf.drain(0..len) {
-                dest[i] = r;
-                i += 1;
-            }
-
-            self.remainder = buf;
-        }
-
-        // Only subtract what was actually consumed: on an underrun the
-        // remaining destination is silence, not queued samples, so charging
-        // the full request would make `samples` drift permanently negative
-        // and corrupt the render thread's cushion check.
-        let samples = self.stats.samples.fetch_sub(i as i64, Ordering::SeqCst);
-        self.stats
-            .last_samples_after_read
-            .store(samples, Ordering::Relaxed);
+    /// Returns the stream parameters of the audio output.
+    pub fn stream_params(&self) -> AudioStreamParams {
+        self.stream_params
     }
 
     /// Sets the number of samples that should be rendered each iteration.
+    ///
+    /// 纯原子写：非实时线程调用不会阻塞音频线程（**无锁**）。
     pub fn set_render_size(&self, size: usize) {
         self.stats.render_size.store(size, Ordering::SeqCst);
     }
 
     /// Returns a statistics reader.
     /// See the `BufferedRendererStatsReader` documentation for more information.
+    ///
+    /// 只克隆 `Arc`：非实时线程调用不会阻塞音频线程（**无锁**）。
     pub fn get_buffer_stats(&self) -> BufferedRendererStatsReader {
         BufferedRendererStatsReader {
             stats: self.stats.clone(),
@@ -350,7 +393,7 @@ impl Drop for BufferedRenderer {
     }
 }
 
-impl AudioPipe for BufferedRenderer {
+impl AudioPipe for BufferedRendererReader {
     fn stream_params(&self) -> &'_ AudioStreamParams {
         &self.stream_params
     }
@@ -365,15 +408,43 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{
-            atomic::{AtomicI64, AtomicUsize},
+            atomic::{AtomicI64, AtomicUsize, Ordering},
             Arc, RwLock,
         },
+        time::Duration,
     };
 
     use super::{
-        BufferedRendererStats, BufferedRendererStatsReader, CUSHION_WAIT_MAX_SECS,
-        cushion_target_interleaved, cushion_wait_secs,
+        BufferedRenderer, BufferedRendererReader, BufferedRendererStats,
+        BufferedRendererStatsReader, CUSHION_WAIT_MAX_SECS, cushion_target_interleaved,
+        cushion_wait_secs,
     };
+    use crate::audio_pipe::AudioPipe;
+    use crate::audio_stream::{AudioStreamParams, ChannelCount};
+    use crate::FunctionAudioPipe;
+    use crossbeam_channel::{Receiver, unbounded};
+
+    fn test_stats() -> BufferedRendererStats {
+        BufferedRendererStats {
+            samples: Arc::new(AtomicI64::new(0)),
+            last_samples_after_read: Arc::new(AtomicI64::new(0)),
+            last_request_samples: Arc::new(AtomicI64::new(0)),
+            render_time: Arc::new(RwLock::new(VecDeque::new())),
+            render_size: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn test_reader(
+        receive: Receiver<Vec<f32>>,
+        stats: BufferedRendererStats,
+    ) -> BufferedRendererReader {
+        BufferedRendererReader {
+            receive,
+            remainder: Vec::new(),
+            stats,
+            stream_params: AudioStreamParams::new(48_000, ChannelCount::Stereo),
+        }
+    }
 
     #[test]
     fn average_renderer_load_is_zero_when_no_samples_have_been_rendered() {
@@ -389,6 +460,97 @@ mod tests {
 
         assert_eq!(reader.average_renderer_load(), 0.0);
         assert_eq!(reader.last_renderer_load(), 0.0);
+    }
+
+    #[test]
+    fn reader_zero_fills_underrun_and_counts_only_consumed_samples() {
+        // 播放侧语义契约（从 `BufferedRenderer::read` 迁移而来，必须逐位一致）：
+        // 队列不足时余下部分是**静音**，且 `samples` 只扣实际消费量——
+        // 若按请求量扣，欠载会让计数永久偏负并破坏渲染线程的缓冲判断。
+        let (tx, rx) = unbounded();
+        let stats = test_stats();
+        stats.samples.store(4, Ordering::SeqCst);
+        let mut reader = test_reader(rx, stats.clone());
+        tx.send(vec![1.0, 2.0, 3.0, 4.0]).expect("send block");
+
+        let mut dest = [9.0f32; 8];
+        reader.read(&mut dest);
+
+        assert_eq!(dest, [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(stats.last_request_samples.load(Ordering::SeqCst), 8);
+        // 契约钉住：`last_samples_after_read` 存的是**本次读取前**的缓冲计数
+        // （`fetch_sub` 的返回值），不是读后的剩余量。历史语义如此，
+        // `perf_nps` 的 `b < 0`（读前已空 = 欠载）判定依赖它，故不改，只固化。
+        assert_eq!(stats.last_samples_after_read.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            stats.samples.load(Ordering::SeqCst),
+            0,
+            "只应扣掉实际消费的 4 个样本"
+        );
+    }
+
+    #[test]
+    fn reader_keeps_remainder_for_next_read() {
+        // 一个块大于一次请求时，多余样本必须留到下一次读取（不得丢弃、不得重复）。
+        let (tx, rx) = unbounded();
+        let stats = test_stats();
+        stats.samples.store(8, Ordering::SeqCst);
+        let mut reader = test_reader(rx, stats.clone());
+        tx.send(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+            .expect("send block");
+
+        let mut first = [0.0f32; 4];
+        reader.read(&mut first);
+        assert_eq!(first, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(stats.samples.load(Ordering::SeqCst), 4);
+
+        // 第二次读取完全由 remainder 供数，无需新块。
+        let mut second = [0.0f32; 4];
+        reader.read(&mut second);
+        assert_eq!(second, [5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(stats.samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reader_reports_stream_params_as_audio_pipe() {
+        let (_tx, rx) = unbounded();
+        let reader = test_reader(rx, test_stats());
+        assert_eq!(reader.stream_params().sample_rate, 48_000);
+    }
+
+    #[test]
+    fn control_side_is_lock_free_while_reader_is_active() {
+        // 本改动核心契约：控制侧（统计读取 / 改渲染块大小）与播放侧（reader）
+        // 之间**不再有共享锁**——非实时线程可自由调用，结构上不可能阻塞音频线程。
+        // 这里做一次真实的跨线程并发调用（若仍存在共享锁，此测试就是那个锁的争用点）。
+        let params = AudioStreamParams::new(48_000, ChannelCount::Stereo);
+        let renderer = Arc::new(
+            BufferedRenderer::new(
+                FunctionAudioPipe::new(params, |out: &mut [f32]| out.fill(0.25)),
+                params,
+                480,
+                4_800,
+            )
+            .expect("BufferedRenderer::new"),
+        );
+        let mut reader = renderer.reader();
+
+        let control = Arc::clone(&renderer);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                let _ = control.get_buffer_stats().samples();
+                control.set_render_size(480);
+            }
+        });
+
+        let mut dest = vec![0.0f32; 960];
+        for _ in 0..120 {
+            reader.read(&mut dest);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle.join().expect("控制侧线程不得 panic");
+        drop(reader);
+        drop(renderer);
     }
 
     #[test]

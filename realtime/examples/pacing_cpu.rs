@@ -139,18 +139,20 @@ fn main() {
     report("baseline(仅消费者)", wall0, cpu0);
 
     // 被测：真实 BufferedRenderer（零成本静音管道 → 测得的全是 pacing 成本）。
-    let mut renderer = BufferedRenderer::new(
+    let renderer = BufferedRenderer::new(
         FunctionAudioPipe::new(params, |out: &mut [f32]| out.fill(PIPE_LEVEL)),
         params,
         block,
         cushion,
     )
     .expect("BufferedRenderer::new");
+    // 播放消费端由音频回调独占持有（无锁）；测量台在同一线程里扮演该角色。
+    let mut reader = renderer.reader();
 
     let cpu1 = process_cpu_secs();
     let (wall1, warmup_missing, steady_missing) =
         drain_realtime(secs, &mut sink, PIPE_LEVEL, WARMUP_BLOCKS, |s| {
-            renderer.read(s)
+            reader.read(s)
         });
     let cpu1 = process_cpu_secs().zip(cpu1).map(|(a, b)| a - b);
     report("BufferedRenderer 渲染线程", wall1, cpu1);
