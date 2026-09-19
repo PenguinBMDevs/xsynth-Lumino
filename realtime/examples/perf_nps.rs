@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             render_window_ms: 24.0,
             channel_init_options: ChannelInitOptions {
                 fade_out_killing: true,
+                max_voices: None,
             },
             ..Default::default()
         },
@@ -56,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_nps: 0,
             channel_init_options: ChannelInitOptions {
                 fade_out_killing: true,
+                max_voices: None,
             },
             ..Default::default()
         },

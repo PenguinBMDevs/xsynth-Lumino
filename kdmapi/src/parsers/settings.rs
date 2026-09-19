@@ -40,11 +40,14 @@ impl Settings {
         XSynthRealtimeConfig {
             channel_init_options: ChannelInitOptions {
                 fade_out_killing: self.fade_out_killing,
+                max_voices: None,
             },
             render_window_ms: self.render_window_ms,
             format: SynthFormat::Midi,
             multithreading: self.multithreading,
             ignore_range: self.ignore_range.clone(),
+            // 新增治理字段与 NPS 配置走默认值：kdmapi 设置项不暴露治理参数。
+            ..Default::default()
         }
     }
 }

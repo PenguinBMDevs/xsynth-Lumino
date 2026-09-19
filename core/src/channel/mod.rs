@@ -58,6 +58,16 @@ pub struct ChannelInitOptions {
     ///
     /// Default: `false`
     pub fade_out_killing: bool,
+
+    /// Maximum number of active voices per channel (`None` = unlimited,
+    /// `Some(0)` is treated as unlimited too).
+    ///
+    /// When exceeded, the oldest voice groups of the busiest keys are released
+    /// first, so newly played notes keep sounding (dense black-MIDI safety
+    /// valve that keeps the render load bounded without dropping new notes).
+    ///
+    /// Default: `None`
+    pub max_voices: Option<usize>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -65,6 +75,7 @@ impl Default for ChannelInitOptions {
     fn default() -> Self {
         Self {
             fade_out_killing: false,
+            max_voices: None,
         }
     }
 }
@@ -95,6 +106,9 @@ pub struct VoiceChannel {
     threadpool: Option<Arc<rayon::ThreadPool>>,
 
     stream_params: AudioStreamParams,
+
+    /// Channel configuration (fade-out kills, per-channel voice cap).
+    options: ChannelInitOptions,
 
     /// The helper struct for keeping track of MIDI control event data
     control_event_data: ControlEventData,
@@ -137,6 +151,8 @@ impl VoiceChannel {
             threadpool,
 
             stream_params,
+
+            options,
 
             control_event_data: ControlEventData::new_defaults(stream_params.sample_rate),
             voice_control_data: VoiceControlData::new_defaults(),
@@ -192,25 +208,31 @@ impl VoiceChannel {
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
         self.params.load_program();
 
+        // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
+        for key in self.key_voices.iter_mut() {
+            for e in key.event_cache.drain(..) {
+                key.data.send_event(
+                    e,
+                    &self.voice_control_data,
+                    &self.params.channel_sf,
+                    self.params.layers,
+                );
+            }
+        }
+
+        // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
+        //    使渲染负载有上界，同时不丢刚触发的音符。
+        self.enforce_max_voices();
+
+        // 3) 渲染（可并行）。
         out.fill(0.0);
         crate::profiling::tracy_zone!("channel_keys", {
             match self.threadpool.as_ref() {
                 Some(pool) => {
                     let len = out.len();
                     let key_voices = &mut self.key_voices;
-                    let params = &self.params;
-                    let control_data = &self.voice_control_data;
                     pool.install(|| {
                         key_voices.par_iter_mut().for_each(move |key| {
-                            for e in key.event_cache.drain(..) {
-                                key.data.send_event(
-                                    e,
-                                    control_data,
-                                    &params.channel_sf,
-                                    params.layers,
-                                );
-                            }
-
                             prepapre_cache_vec(&mut key.audio_cache, len, 0.0);
                             key.data.render_to(&mut key.audio_cache);
                         });
@@ -222,15 +244,6 @@ impl VoiceChannel {
                 }
                 None => {
                     for key in self.key_voices.iter_mut() {
-                        for e in key.event_cache.drain(..) {
-                            key.data.send_event(
-                                e,
-                                &self.voice_control_data,
-                                &self.params.channel_sf,
-                                self.params.layers,
-                            );
-                        }
-
                         key.data.render_to(out);
                     }
                 }
@@ -240,6 +253,142 @@ impl VoiceChannel {
         crate::profiling::tracy_zone!("channel_effects", {
             self.apply_channel_effects(out);
         });
+    }
+
+    /// 按分级策略抢占 `count` 个活跃声部（供跨通道全局治理调用）。
+    ///
+    /// 与 `enforce_max_voices` 相同：从最忙的键、按 T1 释放中最轻 → T2 最轻
+    /// 依次抢占；实际抢占数可能小于 `count`（活跃声部不足时）。
+    pub fn steal_voices(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut counts: Vec<usize> = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.active_voice_count())
+            .collect();
+        let total: usize = counts.iter().sum();
+        let mut remaining = count.min(total);
+        while remaining > 0 {
+            let Some(idx) = counts
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count > 0)
+                .max_by_key(|(_, &count)| count)
+                .map(|(idx, _)| idx)
+            else {
+                break;
+            };
+            if self.key_voices[idx].data.steal_voice_group().is_none() {
+                break;
+            }
+            counts[idx] -= 1;
+            remaining -= 1;
+        }
+    }
+
+    /// 硬抢占 `count` 个活跃声部（L2 重度治理：跳过淡出，立即移除）。
+    ///
+    /// 批量化：按各键声部数降序，从最满的键整段弹出，避免"每弹一个都重扫全部键"。
+    pub fn steal_voices_hard(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut order: Vec<usize> = (0..self.key_voices.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.key_voices[i].data.voice_count()));
+        let mut remaining = count;
+        for idx in order {
+            if remaining == 0 {
+                break;
+            }
+            while remaining > 0 && self.key_voices[idx].data.hard_steal_oldest() {
+                remaining -= 1;
+            }
+        }
+    }
+
+    /// 看门狗自愈：每键仅保留最新 `keep` 组声部，其余立即移除。
+    pub fn trim_to_newest(&mut self, keep: usize) {
+        for key in self.key_voices.iter_mut() {
+            key.data.trim_to_newest(keep);
+        }
+    }
+
+    /// 每通道声部上限：超过 `options.max_voices` 时，从"活跃声部最多的键"里
+    /// 按分级策略抢占**活跃**声部（T1 释放中最轻 → T2 最轻），直到回到上限内。
+    ///
+    /// - 活跃数不含已 Kill 的组：被抢的组走 1ms 淡出 + 死期限（见
+    ///   `VoiceBuffer::kill_voice_fade_out`），约 2 块后强制移除；
+    /// - 已 Kill 的组不会被再次抢占（否则活跃计数虚降、治理失效，
+    ///   此前实测导致活跃声部无界增长）；
+    /// - 自然保护：持续长音/低音（力度响、未释放）不会因"最老"被优先命中，
+    ///   只有连衰减音与轻音都不存在时才会被抢。
+    ///
+    /// 性能：计数只统计一次（O(total)），此后在 128 个计数上增量维护；
+    /// 单次抢占 = 选键 O(128) + 在单个键内扫描 O(cap)。
+    fn enforce_max_voices(&mut self) {
+        let Some(cap) = self.options.max_voices else {
+            return;
+        };
+        // 0 视为不限，避免歧义。
+        if cap == 0 {
+            return;
+        }
+
+        let mut counts: Vec<usize> = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.active_voice_count())
+            .collect();
+        let mut total: usize = counts.iter().sum();
+        if total <= cap {
+            return;
+        }
+
+        // 诊断（XSYNTH_GOV_DEBUG=1）：区分"活跃数未压住"与"缓冲残留滞留"。
+        let debug = std::env::var_os("XSYNTH_GOV_DEBUG").is_some();
+        let active_before = total;
+        let buffer_before: usize = self
+            .key_voices
+            .iter()
+            .map(|key| key.data.voice_count())
+            .sum();
+
+        let mut steals = 0usize;
+        while total > cap {
+            let Some(idx) = counts
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count > 0)
+                .max_by_key(|(_, &count)| count)
+                .map(|(idx, _)| idx)
+            else {
+                break;
+            };
+            if self.key_voices[idx].data.steal_voice_group().is_none() {
+                break;
+            }
+            counts[idx] -= 1;
+            total -= 1;
+            steals += 1;
+        }
+
+        if debug {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static EVENTS: AtomicU64 = AtomicU64::new(0);
+            let n = EVENTS.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(200) {
+                let buffer_after: usize = self
+                    .key_voices
+                    .iter()
+                    .map(|key| key.data.voice_count())
+                    .sum();
+                eprintln!(
+                    "[GOV] #{n} cap={cap} active_before={active_before} active_after={total} buffer_before={buffer_before} buffer_after={buffer_after} steals={steals}",
+                );
+            }
+        }
     }
 
     fn propagate_voice_controls(&mut self) {

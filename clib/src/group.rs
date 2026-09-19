@@ -79,6 +79,7 @@ pub extern "C" fn XSynth_GenDefault_GroupOptions() -> XSynth_GroupOptions {
 pub extern "C" fn XSynth_ChannelGroup_Create(options: XSynth_GroupOptions) -> XSynth_ChannelGroup {
     let channel_init_options = ChannelInitOptions {
         fade_out_killing: options.fade_out_killing,
+        max_voices: None,
     };
 
     let config = ChannelGroupConfig {

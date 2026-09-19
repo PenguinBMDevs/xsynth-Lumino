@@ -12,3 +12,6 @@ pub use realtime_synth::*;
 
 mod event_senders;
 pub use event_senders::*;
+
+mod governor;
+pub use governor::*;

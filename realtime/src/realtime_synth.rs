@@ -2,10 +2,11 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self},
+    time::Instant,
 };
 
 use cpal::{
@@ -18,7 +19,7 @@ use thiserror::Error;
 
 use xsynth_core::{
     buffered_renderer::{BufferedRenderer, BufferedRendererStatsReader},
-    channel::{ChannelConfigEvent, ChannelEvent, VoiceChannel},
+    channel::{ChannelAudioEvent, ChannelConfigEvent, ChannelEvent, VoiceChannel},
     channel_group::SynthFormat,
     effects::VolumeLimiter,
     helpers::{prepapre_cache_vec, sum_simd},
@@ -26,7 +27,8 @@ use xsynth_core::{
 };
 
 use crate::{
-    util::ReadWriteAtomicU64, RealtimeEventSender, SynthEvent, ThreadCount, XSynthRealtimeConfig,
+    util::ReadWriteAtomicU64, EmergencyGate, Governor, RealtimeEventSender, SynthEvent,
+    ThreadCount, XSynthRealtimeConfig, DEFAULT_HARD_MAX_VOICES,
 };
 
 #[derive(Debug, Error)]
@@ -153,10 +155,32 @@ struct RealtimeSynthThreadSharedData {
     event_senders: RealtimeEventSender,
 }
 
+/// 通道线程命令。
+///
+/// - `Render`：渲染一块并送回管线（现行为）；
+/// - `Steal`：软抢占（分级选择 + 短淡出 + 死期限）；
+/// - `HardSteal`：硬抢占（L2 重度治理：跳过淡出立即移除）；
+/// - `WatchdogReset`：L4 看门狗自愈（每键仅保留最新 N 组）。
+enum ChannelCommand {
+    Render(Vec<f32>),
+    Steal(usize),
+    HardSteal(usize),
+    WatchdogReset(usize),
+}
+
 struct PreparedRealtimeChannels {
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
     senders: Vec<crossbeam_channel::Sender<ChannelEvent>>,
-    command_senders: Vec<crossbeam_channel::Sender<Vec<f32>>>,
+    command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
+    /// 全局 NoteOn 入场预算池（软目标 - 当前声部数，管道每块刷新）。
+    /// 全局共享：单通道文件可独享整个预算，多通道文件按需竞争。
+    admission_budget: Arc<AtomicI64>,
+    /// 紧急模式（洪峰/保命闸）：通道侧直接丢弃新 NoteOn，避免"抢一个放一个"
+    /// 的连续淡出噪声（电锯音）；洪峰过后自动解除。
+    emergency: Arc<AtomicBool>,
+    /// 冲洗纪元：紧急模式进入/退出时递增，通道据此整队列冲洗一次
+    /// （丢弃残留 NoteOn），消除洪峰尾料被逐块消化产生的噼啪声。
+    flush_epoch: Arc<AtomicU64>,
     join_handles: Vec<thread::JoinHandle<()>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
 }
@@ -322,6 +346,9 @@ impl RealtimeSynth {
             channel_stats,
             senders,
             command_senders,
+            admission_budget,
+            emergency,
+            flush_epoch,
             join_handles,
             output_receiver,
         } = prepare_channels(
@@ -334,22 +361,34 @@ impl RealtimeSynth {
         )?;
 
         let stats = RealtimeSynthStats::new();
+        // 硬上限（量程）：`None`/`0` 为自动模式，使用默认 10000。
+        let hard_max_voices = match config.global_max_voices {
+            Some(n) if n > 0 => n,
+            _ => DEFAULT_HARD_MAX_VOICES,
+        };
+        let gate = EmergencyGate::new();
         let render = build_render_pipe(
             stream_params,
             channel_count,
             command_senders,
             output_receiver,
             channel_stats,
+            admission_budget,
+            emergency,
+            flush_epoch,
             &stats,
             master_peak.clone(),
+            hard_max_voices,
+            config.voice_target_ratio,
+            config.soft_nps_gate,
+            gate.clone(),
         );
+        let render_size = calculate_render_size(sample_rate, config.render_window_ms).max(1);
+        let cushion_samples =
+            calculate_render_size(sample_rate, config.cushion_ms).max(render_size);
         let buffered = Arc::new(Mutex::new(
-            BufferedRenderer::new(
-                render,
-                stream_params,
-                calculate_render_size(sample_rate, config.render_window_ms),
-            )
-            .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
+            BufferedRenderer::new(render, stream_params, render_size, cushion_samples)
+                .map_err(RealtimeSynthError::BufferedRendererThreadSpawn)?,
         ));
         let (stream_control, stream_owner, recovery_rx) =
             spawn_stream_thread(device.clone(), stream_config, buffered.clone())?;
@@ -360,8 +399,13 @@ impl RealtimeSynth {
             data: Some(RealtimeSynthThreadSharedData {
                 buffered_renderer: buffered,
 
-                event_senders: RealtimeEventSender::new(senders, max_nps, config.ignore_range)
-                    .map_err(RealtimeSynthError::EventSenderInit)?,
+                event_senders: RealtimeEventSender::new(
+                    senders,
+                    max_nps,
+                    config.ignore_range,
+                    gate,
+                )
+                .map_err(RealtimeSynthError::EventSenderInit)?,
                 stream_control,
             }),
             stream_owner: Some(stream_owner),
@@ -565,6 +609,12 @@ fn prepare_channels(
     let mut senders = Vec::new();
     let mut command_senders = Vec::new();
     let mut join_handles = Vec::new();
+    // 全局入场预算池：初始 0（首块渲染前由管道刷新为真实值）。
+    let admission_budget = Arc::new(AtomicI64::new(0));
+    // 紧急模式标志：初始 false。
+    let emergency = Arc::new(AtomicBool::new(false));
+    // 冲洗纪元：初始 0（管道在紧急模式进出时递增）。
+    let flush_epoch = Arc::new(AtomicU64::new(0));
 
     for i in 0..channel_count {
         let channel = VoiceChannel::new(init_options, stream_params, channel_pool.clone());
@@ -573,7 +623,7 @@ fn prepare_channels(
         let (event_sender, event_receiver) = unbounded();
         senders.push(event_sender);
 
-        let (command_sender, command_receiver) = bounded::<Vec<f32>>(1);
+        let (command_sender, command_receiver) = bounded::<ChannelCommand>(1);
         command_senders.push(command_sender);
 
         let output_sender = output_sender.clone();
@@ -584,6 +634,9 @@ fn prepare_channels(
             event_receiver,
             command_receiver,
             output_sender,
+            admission_budget.clone(),
+            emergency.clone(),
+            flush_epoch.clone(),
         )?;
         join_handles.push(join_handle);
     }
@@ -598,6 +651,9 @@ fn prepare_channels(
         channel_stats,
         senders,
         command_senders,
+        admission_budget,
+        emergency,
+        flush_epoch,
         join_handles,
         output_receiver,
     })
@@ -608,8 +664,11 @@ fn spawn_channel_thread(
     channel_index: u8,
     mix: Arc<Vec<ChannelMix>>,
     event_receiver: crossbeam_channel::Receiver<ChannelEvent>,
-    command_receiver: crossbeam_channel::Receiver<Vec<f32>>,
+    command_receiver: crossbeam_channel::Receiver<ChannelCommand>,
     output_sender: crossbeam_channel::Sender<Vec<f32>>,
+    admission_budget: Arc<AtomicI64>,
+    emergency: Arc<AtomicBool>,
+    flush_epoch: Arc<AtomicU64>,
 ) -> Result<thread::JoinHandle<()>, RealtimeSynthError> {
     thread::Builder::new()
         .name("xsynth_channel_handler".to_string())
@@ -617,19 +676,175 @@ fn spawn_channel_thread(
             // 当前增益/声像：向 UI 设定的目标平滑逼近，避免拖动产生 zipper noise。
             let mut cur_gain = 1.0f32;
             let mut cur_pan = 0.0f32;
+
+            // 声部上限语义（连续播放优先，抢旧不丢新）：
+            // - **全局预算池**（软目标 − 当前总声部数，管道每块刷新）：预算内
+            //   NoteOn 直接发声；预算耗尽时先**抢占一个旧声部**（T1 释放中最轻 →
+            //   T2 最轻，1ms 短淡出）再发声——新音符永远不丢、不推迟、不补发，
+            //   听感连续；超上限的代价由"最不重要的旧声部被硬切"承担。
+            //   这正是"顶到上限有硬切、但音乐不断"的语义（曾经错误的
+            //   defer/drop 实现会把音乐切成碎片并让音频落后进度条）。
+            // - **NoteOff 按"发声计数"正确配对**：键上仍有在响音符时直通。
+            // - 其他事件（CC/PB/Program/Config）永远直通。
+            // 每键"已下发且尚未收到 NoteOff"的音符数（FIFO 配对基准）。
+            let mut sounding = [0u32; 128];
+            // 单次 admit 调用最多从队列取的事件数（每块调用约 2 次）：
+            // 正常播放每通道每块仅需个位数~几十个事件（含单通道超密文件 ~200），
+            // 256 足够；洪峰（1M NPS）时把注入量封顶，避免 V 在一个块内冲到数万。
+            const DRAIN_CAP: usize = 256;
+            // 紧急模式下加速排空队列（丢弃便宜，快速清掉洪峰积压）。
+            const DRAIN_CAP_EMERGENCY: usize = 4096;
+            // 预算取用：`fetch_sub` 返回旧值，>0 表示取到额度；取不到则回补（净零）。
+            let try_acquire = |budget: &AtomicI64| -> bool {
+                if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    true
+                } else {
+                    budget.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            };
+            // 每键"被紧急丢弃、尚未收到 NoteOff"的音符数（配对取消，防挂音）。
+            let mut dropped = [0u32; 128];
+            let mut seen_epoch: u64 = flush_epoch.load(Ordering::Relaxed);
+            let admit = |channel: &mut VoiceChannel,
+                         sounding: &mut [u32; 128],
+                         dropped: &mut [u32; 128],
+                         seen_epoch: &mut u64| {
+                // 冲洗纪元变化（紧急模式进入/退出）：整队列丢弃残留 NoteOn，
+                // NoteOff 按配对计数取消，其余事件直通。最多 16384/次，
+                // 未清完下次继续（seen_epoch 未推进）。
+                let epoch = flush_epoch.load(Ordering::Relaxed);
+                if epoch != *seen_epoch {
+                    let mut n = 0usize;
+                    while n < 16384 {
+                        let Ok(event) = event_receiver.try_recv() else {
+                            *seen_epoch = epoch;
+                            break;
+                        };
+                        n += 1;
+                        match event {
+                            ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, .. }) => {
+                                dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                            }
+                            ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
+                                let k = key as usize;
+                                if k < dropped.len() && dropped[k] > 0 {
+                                    dropped[k] -= 1;
+                                } else {
+                                    if k < sounding.len() && sounding[k] > 0 {
+                                        sounding[k] -= 1;
+                                    }
+                                    channel.process_event(ChannelEvent::Audio(
+                                        ChannelAudioEvent::NoteOff { key },
+                                    ));
+                                }
+                            }
+                            other => channel.process_event(other),
+                        }
+                    }
+                }
+                // 紧急模式（洪峰/保命闸）：新 NoteOn 直接丢弃、不再"抢一个放一个"
+                // ——后者在积压排空期间会形成连续 1ms 淡出叠加的"电锯"噪声。
+                let emergency_now = emergency.load(Ordering::Relaxed);
+                let drain_cap = if emergency_now {
+                    DRAIN_CAP_EMERGENCY
+                } else {
+                    DRAIN_CAP
+                };
+                let mut drained = 0;
+                while drained < drain_cap {
+                    let Ok(event) = event_receiver.try_recv() else {
+                        break;
+                    };
+                    drained += 1;
+                    match event {
+                        ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }) => {
+                            if emergency_now {
+                                dropped[key as usize] = dropped[key as usize].saturating_add(1);
+                            } else {
+                                if !try_acquire(&admission_budget) {
+                                    // 预算耗尽：抢一个最不重要的旧声部再发声，
+                                    // 保证"每个新音符都响"，避免断续与补发旧音。
+                                    channel.steal_voices(1);
+                                }
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOn { key, vel },
+                                ));
+                                sounding[key as usize] += 1;
+                            }
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::NoteOff { key }) => {
+                            let k = key as usize;
+                            if k < dropped.len() && dropped[k] > 0 {
+                                // 该音符在紧急模式下被丢弃：NoteOff 配对取消，不下发。
+                                dropped[k] -= 1;
+                            } else {
+                                if k < sounding.len() && sounding[k] > 0 {
+                                    // 该键仍有在响音符：NoteOff 必须下发，释放对应声部。
+                                    sounding[k] -= 1;
+                                }
+                                channel.process_event(ChannelEvent::Audio(
+                                    ChannelAudioEvent::NoteOff { key },
+                                ));
+                            }
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff) => {
+                            sounding.fill(0);
+                            dropped.fill(0);
+                            channel
+                                .process_event(ChannelEvent::Audio(ChannelAudioEvent::AllNotesOff));
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled) => {
+                            sounding.fill(0);
+                            dropped.fill(0);
+                            channel.process_event(ChannelEvent::Audio(
+                                ChannelAudioEvent::AllNotesKilled,
+                            ));
+                        }
+                        ChannelEvent::Audio(ChannelAudioEvent::SystemReset) => {
+                            sounding.fill(0);
+                            dropped.fill(0);
+                            channel
+                                .process_event(ChannelEvent::Audio(ChannelAudioEvent::SystemReset));
+                        }
+                        other => channel.process_event(other),
+                    }
+                }
+            };
+
             loop {
                 crate::profiling::tracy_zone!("ch_drain_events", {
-                    channel.push_events_iter(event_receiver.try_iter());
+                    admit(&mut channel, &mut sounding, &mut dropped, &mut seen_epoch);
                 });
-                let mut vec = match crate::profiling::tracy_zone!("ch_wait_render", {
+                let command = match crate::profiling::tracy_zone!("ch_wait_render", {
                     command_receiver.recv()
                 }) {
-                    Ok(vec) => vec,
+                    Ok(command) => command,
                     Err(_) => break,
                 };
                 crate::profiling::tracy_zone!("ch_drain_events_late", {
-                    channel.push_events_iter(event_receiver.try_iter());
+                    admit(&mut channel, &mut sounding, &mut dropped, &mut seen_epoch);
                 });
+
+                let mut vec = match command {
+                    // 全局治理：只抢占声部，不渲染、不回送音频块。
+                    ChannelCommand::Steal(count) => {
+                        channel.steal_voices(count);
+                        continue;
+                    }
+                    // L2 重度治理：硬移除（跳过淡出）。
+                    ChannelCommand::HardSteal(count) => {
+                        channel.steal_voices_hard(count);
+                        continue;
+                    }
+                    // L4 看门狗：每键仅保留最新 N 组，立即释放其余。
+                    ChannelCommand::WatchdogReset(keep) => {
+                        channel.trim_to_newest(keep);
+                        continue;
+                    }
+                    ChannelCommand::Render(vec) => vec,
+                };
+
                 crate::profiling::tracy_zone!("ch_render_samples", {
                     channel.read_samples(&mut vec);
                 });
@@ -662,14 +877,22 @@ fn spawn_channel_thread(
         .map_err(RealtimeSynthError::ChannelThreadSpawn)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_render_pipe(
     stream_params: AudioStreamParams,
     channel_count: u32,
-    command_senders: Vec<crossbeam_channel::Sender<Vec<f32>>>,
+    command_senders: Vec<crossbeam_channel::Sender<ChannelCommand>>,
     output_receiver: crossbeam_channel::Receiver<Vec<f32>>,
     channel_stats: Vec<xsynth_core::channel::VoiceChannelStatsReader>,
+    admission_budget: Arc<AtomicI64>,
+    emergency: Arc<AtomicBool>,
+    flush_epoch: Arc<AtomicU64>,
     stats: &RealtimeSynthStats,
     master_peak: Arc<AtomicU32>,
+    hard_max_voices: usize,
+    voice_target_ratio: f64,
+    soft_nps_gate: bool,
+    gate: Arc<EmergencyGate>,
 ) -> FunctionAudioPipe<impl FnMut(&mut [f32]) + Send> {
     let mut vec_cache: VecDeque<Vec<f32>> = VecDeque::new();
     for _ in 0..channel_count {
@@ -677,13 +900,22 @@ fn build_render_pipe(
     }
 
     let total_voice_count = stats.voice_count.clone();
+    let sample_rate = stream_params.sample_rate as f64;
+    let output_channels = (stream_params.channels.count() as f64).max(1.0);
+
+    // 声部治理器：运行目标固定 = ratio × 硬上限（不随负载漂移，防自激）。
+    let mut governor = Governor::new(hard_max_voices, voice_target_ratio);
+    // 紧急模式状态（用于检测进入/退出边沿并冲洗队列）。
+    let mut prev_emergency = false;
 
     FunctionAudioPipe::new(stream_params, move |out| {
+        let block_start = Instant::now();
+
         crate::profiling::tracy_zone!("pipe_dispatch", {
             for sender in &command_senders {
                 let mut buf = vec_cache.pop_front().unwrap();
                 prepapre_cache_vec(&mut buf, out.len(), 0.0);
-                sender.send(buf).unwrap();
+                sender.send(ChannelCommand::Render(buf)).unwrap();
             }
         });
 
@@ -707,8 +939,119 @@ fn build_render_pipe(
         };
         master_peak.store(peak.to_bits(), Ordering::Relaxed);
 
-        let total_voices = channel_stats.iter().map(|c| c.voice_count()).sum();
+        let total_voices: u64 = channel_stats.iter().map(|c| c.voice_count()).sum();
         total_voice_count.store(total_voices, Ordering::SeqCst);
+
+        // 负载 = 本块渲染耗时 / 块时长（与采样率无关的可比量）。
+        let block_secs = out.len() as f64 / (sample_rate * output_channels);
+        let load = if block_secs > 0.0 {
+            block_start.elapsed().as_secs_f64() / block_secs
+        } else {
+            0.0
+        };
+
+        let action = governor.update(load, total_voices, soft_nps_gate);
+        gate.set(action.gate_active, action.gate_rate);
+
+        // 紧急模式状态机（迟滞）：洪峰（瞬时 load>2）、保命闸启用或持续重载时进入，
+        // 通道侧转为"直接丢弃新 NoteOn"（不抢不补），避免积压排空期"抢一个放一个"
+        // 的连续 1ms 淡出叠加噪声（电锯音）；负载回落后退出。
+        let mut em = emergency.load(Ordering::Relaxed);
+        if !em && (load > 2.0 || governor.load_ema() > 1.2 || action.gate_active) {
+            em = true;
+        } else if em && governor.load_ema() < 0.8 && load < 1.0 {
+            em = false;
+        }
+        emergency.store(em, Ordering::Relaxed);
+        // 紧急模式进入/退出边沿：递增冲洗纪元，通道整队列冲洗一次，
+        // 丢弃残留 NoteOn（洪峰尾料不再被逐块消化成噼啪声）。
+        if em != prev_emergency {
+            flush_epoch.fetch_add(1, Ordering::Relaxed);
+            prev_emergency = em;
+        }
+
+        // 刷新全局入场预算池："软目标 - 当前总声部数"（由通道侧原子取用），
+        // 下一块各通道据此接纳 NoteOn；单通道文件可独享整个预算。
+        let available_voice_budget = (governor.v_soft() - total_voices as f64).max(0.0) as i64;
+        admission_budget.store(available_voice_budget, Ordering::Relaxed);
+
+        // 跨通道全局治理：从"声部最多的通道"按比例分摊抢占。
+        // 全部使用**软抢占**（T1 释放中最轻 → T2 最轻，1ms 淡出）：
+        // 硬删除（pop_front 无淡出）在洪峰回收期会产生成片的"噼啪"pop，
+        // 而软抢占在听感上是平滑的短淡出。数量已由治理器限制在总声部数 1/4 内，
+        // 这里只做一个防御性上限，避免异常值造成块内长任务。
+        let want = action.steal.max(action.hard_steal).min(4096);
+        if want > 0 {
+            let mut deficit = want as u64;
+            let mut counts: Vec<u64> = channel_stats.iter().map(|c| c.voice_count()).collect();
+            let mut order: Vec<usize> = (0..channel_count as usize).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
+            for i in order {
+                if deficit == 0 {
+                    break;
+                }
+                let take = counts[i].min(deficit);
+                if take == 0 {
+                    continue;
+                }
+                if command_senders[i]
+                    .send(ChannelCommand::Steal(take as usize))
+                    .is_ok()
+                {
+                    counts[i] -= take;
+                    deficit -= take;
+                }
+            }
+        }
+
+        // L4 看门狗：每键仅保留最新 K 组 + 重置治理基线，避免带着过载
+        // 历史继续决策（自愈，防"顶破缓冲后永久损坏"）。
+        if let Some(keep) = action.watchdog_keep {
+            for sender in &command_senders {
+                sender.send(ChannelCommand::WatchdogReset(keep)).ok();
+            }
+            gate.set(false, action.gate_rate);
+            governor.reset_after_watchdog();
+        }
+
+        // 治理诊断（受 XSYNTH_GOV_DEBUG 控制）：异常时 1s 一次，正常时 5s 一次，
+        // 始终输出 V/soft/def，便于观察撞墙与积压情况。
+        if std::env::var_os("XSYNTH_GOV_DEBUG").is_some() {
+            static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let interval = if governor.level > 0 { 1 } else { 5 };
+            if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= interval {
+                LAST_LOG.store(now, Ordering::Relaxed);
+                // 诊断：声部最多的 3 个通道 + 各通道最大积压 NoteOn（定位病态分布）。
+                let mut counts: Vec<(usize, u64)> = channel_stats
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.voice_count()))
+                    .collect();
+                counts.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+                let top = counts
+                    .iter()
+                    .take(3)
+                    .map(|(i, v)| format!("c{i}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "[GOV] L{} load={:.3} V={} soft={:.0} steal={} hard={} gate={} em={} top=[{}]",
+                    governor.level,
+                    governor.load_ema(),
+                    total_voices,
+                    governor.v_soft(),
+                    action.steal,
+                    action.hard_steal,
+                    action.gate_active,
+                    em,
+                    top,
+                );
+            }
+        }
     })
 }
 
@@ -980,12 +1323,13 @@ mod tests {
 
     #[test]
     fn apply_channel_mix_gain_and_pan() {
-        // 立体声交织 [L,R,L,R]；增益 1、声像居中 → 不变
+        // 立体声交织 [L,R,L,R]；等功率声像：居中为 sqrt(0.5)（-3dB）
         let mut buf = vec![1.0, 1.0, 1.0, 1.0];
         apply_channel_mix(&mut buf, 1.0, 0.0);
+        let center = 0.5f32.sqrt();
         assert!(
-            (buf[0] - 1.0).abs() < 1e-5 && (buf[1] - 1.0).abs() < 1e-5,
-            "居中增益1应不变: {buf:?}"
+            (buf[0] - center).abs() < 1e-5 && (buf[1] - center).abs() < 1e-5,
+            "center pan must be equal-power: {buf:?}"
         );
 
         // 全左 → 右声道归零，左声道保持

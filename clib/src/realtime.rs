@@ -70,6 +70,7 @@ pub struct XSynth_RealtimeStats {
 pub extern "C" fn XSynth_Realtime_Create(config: XSynth_RealtimeConfig) -> XSynth_RealtimeSynth {
     let channel_init_options = ChannelInitOptions {
         fade_out_killing: config.fade_out_killing,
+        max_voices: None,
     };
 
     let options = XSynthRealtimeConfig {
@@ -78,6 +79,9 @@ pub extern "C" fn XSynth_Realtime_Create(config: XSynth_RealtimeConfig) -> XSynt
         format: convert_synth_format(config.channels),
         multithreading: convert_threadcount(config.multithreading),
         ignore_range: config.ignore_range.start..=config.ignore_range.end,
+        // 新增治理字段（cushion/global_max_voices/voice_target_ratio/soft_nps_gate）
+        // 与 NPS 配置走默认值：C ABI 不暴露治理参数。
+        ..Default::default()
     };
 
     match RealtimeSynth::open_with_default_output(options) {

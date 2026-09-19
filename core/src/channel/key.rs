@@ -1,18 +1,13 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicU64, Arc};
 
 use super::{
-    channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::VoiceBuffer,
-    ChannelInitOptions, VoiceControlData,
+    channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::StealTier,
+    voice_buffer::VoiceBuffer, ChannelInitOptions, VoiceControlData,
 };
 
 pub struct KeyData {
     key: u8,
     voices: VoiceBuffer,
-    last_voice_count: usize,
-    shared_voice_counter: Arc<AtomicU64>,
 }
 
 impl KeyData {
@@ -23,9 +18,7 @@ impl KeyData {
     ) -> KeyData {
         KeyData {
             key,
-            voices: VoiceBuffer::new(options),
-            last_voice_count: 0,
-            shared_voice_counter,
+            voices: VoiceBuffer::new(shared_voice_counter, options),
         }
     }
 
@@ -73,21 +66,35 @@ impl KeyData {
             }
             self.voices.remove_ended_voices();
         }
-
-        let voice_count = self.voices.voice_count();
-        let change = voice_count as i64 - self.last_voice_count as i64;
-        if change < 0 {
-            self.shared_voice_counter
-                .fetch_sub((-change) as u64, Ordering::SeqCst);
-        } else {
-            self.shared_voice_counter
-                .fetch_add(change as u64, Ordering::SeqCst);
-        }
-        self.last_voice_count = voice_count;
     }
 
     pub fn has_voices(&self) -> bool {
         self.voices.has_voices()
+    }
+
+    /// 当前活跃（未被 Kill）的声部组数量（用于每通道声部上限治理）。
+    pub fn active_voice_count(&self) -> usize {
+        self.voices.active_voice_count()
+    }
+
+    /// 当前缓冲中的声部组总数（含已 Kill 待移除的组，用于诊断）。
+    pub fn voice_count(&self) -> usize {
+        self.voices.voice_count()
+    }
+
+    /// 按分级策略抢占一组声部（短淡出 + 死期限）。返回被抢层级。
+    pub fn steal_voice_group(&mut self) -> Option<StealTier> {
+        self.voices.steal_voice_group()
+    }
+
+    /// 硬移除最老的一组声部（L2 重度治理）。
+    pub fn hard_steal_oldest(&mut self) -> bool {
+        self.voices.hard_steal_oldest()
+    }
+
+    /// 看门狗：仅保留最新 `keep` 组声部。
+    pub fn trim_to_newest(&mut self, keep: usize) {
+        self.voices.trim_to_newest(keep);
     }
 
     pub fn set_damper(&mut self, damper: bool) {

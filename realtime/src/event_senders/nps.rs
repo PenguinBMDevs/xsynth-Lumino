@@ -1,3 +1,8 @@
+//! 上游 NPS 限流已彻底移除（NoteOn 不再按 NPS 丢弃）。
+//! 本模块保留为历史参考与 API 兼容，不再参与实时丢音决策，
+//! 因此允许其中的统计结构与判定函数处于未使用状态。
+#![allow(dead_code)]
+
 use std::{
     collections::VecDeque,
     io,
@@ -127,6 +132,9 @@ impl Drop for RoughNpsTracker {
     }
 }
 
+/// 上游 NPS 限流已彻底移除（NoteOn 不再按 NPS 丢弃）；该判定保留仅供
+/// 其它后端/历史测试参考，不再参与实时丢音决策。
+#[allow(dead_code)]
 pub(super) fn should_send_for_vel_and_nps(vel: u8, nps: u64, max: u64) -> bool {
     (vel as u64) * max / 127 > nps
 }
