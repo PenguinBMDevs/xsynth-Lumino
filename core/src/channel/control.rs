@@ -280,9 +280,24 @@ impl VoiceChannel {
         let pitch_bend = data.pitch_bend_value;
         let fine_tune = data.fine_tune_value;
         let coarse_tune = data.coarse_tune_value;
+        // 防御（REND-006）：RPN 灵敏度/调音/弯音的组合理论上限约 ±200 半音；
+        // 异常控制数据或 NaN 会让 2^(combined/12) 溢出为 Inf/NaN，进而在采样器
+        // 插值中出现 0*Inf=NaN 的样本污染（实测 8 端口黑 MIDI：PB ∧ DataEntry ∧
+        // RPN 选择 三者组合触发）。对 combined 做有限性检查 + 钳制。
         let combined = pitch_bend + coarse_tune + fine_tune / 100.0;
-
-        self.voice_control_data.voice_pitch_multiplier = 2.0f32.powf(combined / 12.0);
+        let combined = if combined.is_finite() {
+            combined.clamp(-192.0, 192.0)
+        } else {
+            0.0
+        };
+        let multiplier = 2.0f32.powf(combined / 12.0);
+        // 双保险：乘数只接受有限正值，否则回落到基准音高。
+        self.voice_control_data.voice_pitch_multiplier =
+            if multiplier.is_finite() && multiplier > 0.0 {
+                multiplier
+            } else {
+                1.0
+            };
         self.propagate_voice_controls();
     }
 
@@ -344,5 +359,29 @@ mod tests {
         channel.process_control_event(ControlEvent::Raw(0x79, 0));
 
         assert_eq!(channel.control_event_data.volume.end, 1.0);
+    }
+
+    /// REND-006 回归：异常/极端的 RPN+PitchBend 控制不得产生非有限音高乘数。
+    #[test]
+    fn process_pitch_guards_non_finite_and_extreme_controls() {
+        let mut channel = new_channel();
+
+        channel.control_event_data.pitch_bend_value = f32::NAN;
+        channel.process_pitch();
+        assert!(
+            channel.voice_control_data.voice_pitch_multiplier.is_finite()
+                && channel.voice_control_data.voice_pitch_multiplier > 0.0,
+            "NaN 控制应回落到基准音高"
+        );
+
+        channel.control_event_data.pitch_bend_value = 1.0e30;
+        channel.control_event_data.coarse_tune_value = 1.0e30;
+        channel.control_event_data.fine_tune_value = 1.0e30;
+        channel.process_pitch();
+        let multiplier = channel.voice_control_data.voice_pitch_multiplier;
+        assert!(
+            multiplier.is_finite() && multiplier > 0.0,
+            "极端控制不得产生非有限乘数: {multiplier}"
+        );
     }
 }

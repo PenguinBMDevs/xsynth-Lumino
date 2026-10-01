@@ -410,6 +410,12 @@ where
             unsafe {
                 for i in 0..S::Vf32::WIDTH {
                     let time = self.increment_time(speed.get_unchecked(i) as f64);
+                    // 防御（REND-006）：上游控制异常时 time 可能为 NaN/Inf 或超出
+                    // i32 范围；直接用会让 `time as i32` 饱和、fractional 巨大，
+                    // 插值出现 0*Inf=NaN 污染整个 buffer。非有限/超界按零处理。
+                    if !time.is_finite() || time.abs() >= 2_147_483_647.0 {
+                        continue;
+                    }
                     // `time % 1.0` 会为每个样本触发 fmod 库调用；改用「截断整数 + 差值」：
                     // 对 0 ≤ time < 2^31 与 fmod 结果逐位等价（两者都是精确运算）。
                     let index = time as i32;
@@ -517,6 +523,11 @@ where
                 for i in 0..S::Vf32::WIDTH {
                     let t = time;
                     time += speed.get_unchecked(i) as f64;
+                    // 防御（REND-006）：非有限/超 i32 范围的 time 按零处理，
+                    // 防止 `as i32` 饱和 + fractional 巨大导致 0*Inf=NaN。
+                    if !t.is_finite() || t.abs() >= 2_147_483_647.0 {
+                        continue;
+                    }
                     // `time % 1.0` 会为每个样本触发 fmod 库调用；改用「截断整数 + 差值」：
                     // 对 0 ≤ time < 2^31 与 fmod 结果逐位等价（两者都是精确运算）。
                     let index = t as i32;
