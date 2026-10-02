@@ -58,13 +58,19 @@ pub struct EnvelopeControlData {
     pub release: Option<u8>,
 }
 
+/// `ReleaseType::Kill` 的淡出时长（秒）。
+///
+/// REND-009 决策（2026-10-02）：1ms 对低频/高电平长音仍是可闻瞬态（#89），
+/// 统一放宽到 5ms。死期限见 `channel::voice_buffer::KILL_DEADLINE_BLOCKS`。
+pub(crate) const KILL_FADE_SECS: f32 = 0.005;
+
 /// How a voice should be released.
 #[derive(Copy, Clone, PartialEq)]
 pub enum ReleaseType {
     /// Standard release. Uses the voice's envelope.
     Standard,
 
-    /// Kills the voice with a fadeout of 1ms.
+    /// Kills the voice with a fadeout of [`KILL_FADE_SECS`].
     Kill,
 }
 

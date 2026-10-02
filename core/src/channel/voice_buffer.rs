@@ -49,7 +49,7 @@ impl Debug for GroupVoice {
 /// `fade_out_killing = true` 时被杀 voice 会保留在 buffer 中，直到本次渲染结束
 /// 由 `remove_ended_voices` 清除。高密度事件积压时（一个渲染块内持续到达大量
 /// NoteOn），每次 `push_voices` 都会触发全 buffer 扫描（`get_active_count` /
-/// `pop_quietest_voice_group`），若保留量无界增长，单块事件处理会退化为
+/// `steal_releasing_voice_group`），若保留量无界增长，单块事件处理会退化为
 /// O(n²)（黑 MIDI 密集段实测渲染负载可达 13~28 倍实时，且长时间无法恢复）。
 /// 给保留量设上界后 buffer 长度被限制在 `active + limit`，扫描成本回到常量级。
 fn fading_retention_limit(max_voices: usize) -> usize {
@@ -71,8 +71,11 @@ pub struct VoiceBuffer {
     voice_counter: Arc<AtomicU64>,
 }
 
-/// Kill（1ms 淡出）后最多保留的渲染块数：到期强制移除，防止循环采样滞留。
-const KILL_DEADLINE_BLOCKS: u32 = 2;
+/// Kill（`KILL_FADE_SECS` 淡出）后最多保留的渲染块数：到期强制移除，防止循环采样滞留。
+///
+/// 4 块覆盖 5ms 淡出在直至 192kHz / 256 帧块的组合（4×256=1024 ≥ 960），
+/// 避免高采样率下淡出未走完就被死期限硬移除。
+const KILL_DEADLINE_BLOCKS: u32 = 4;
 
 /// 抢占层级：T1 释放中最轻 → T2 最轻（并列取最老）。
 ///
@@ -115,28 +118,26 @@ impl VoiceBuffer {
         self.id_counter
     }
 
-    /// 抢占同键上「最不重要」的一组声部：**优先已进入 release 的组**（正在衰减的
-    /// 尾巴），其次最轻者（并列取最老——从队首迭代、严格小于保持首个）。
+    /// 回收同键上一组**已进入 release** 的声部（正在衰减的尾巴）。
     ///
-    /// 两条硬约束（修复「长音被直接杀掉」）：
+    /// REND-009 决策（2026-10-02，用户拍板「只杀释放 + 5ms 淡出」）：
     ///
-    /// 1. **永远走 1ms 淡出**（`kill_voice_fade_out`），不做零淡出硬切。
-    ///    历史实现按 `fade_out_killing` 分支，关闭时用 `buffer.drain()` 立即出队：
-    ///    那是采样级不连续 —— 既是可闻 click，也正是用户报告的「长音无法完整播放、
-    ///    音符被直接杀掉」（同键第 N+1 次触发把仍在响的持音瞬间抹掉）。
-    ///    淡出后的组由 `remove_ended_voices`（同块末）或 `KILL_DEADLINE_BLOCKS`
-    ///    死期限清理，保留量由 `trim_excess_fading_voices` 兜底。
-    /// 2. **保护持音**：SF2 sustain 循环、延音踏板下的长音都是「未释放」；
-    ///    优先抢 release 中的尾巴 → 重复音符杀掉的总是前一次的余音，
-    ///    只有在同键所有组都未释放时才会命中持音（复音上限仍然严格维持）。
-    fn pop_quietest_voice_group(&mut self, ignored_id: usize) {
+    /// 1. **只杀释放中的声部**：持音（按键未松、踏板挂起的 SF2 sustain 循环）
+    ///    **永不**被每键上限抢占——避免"长音没弄完就被松开"的听感损坏。
+    /// 2. **无可抢的释放组时不动作**（返回 `false`）：允许暂时超出每键上限，
+    ///    待其自然释放后回落；上限语义 = 「释放尾音预算 + 软约束」。
+    /// 3. 被抢组走 Kill 淡出（`kill_voice_fade_out` → `KILL_FADE_SECS` = 5ms），
+    ///    保留量由 `trim_excess_fading_voices` 兜底，死期限由
+    ///    `remove_ended_voices` 清理。
+    ///
+    /// 返回是否成功抢到一组（调用方的 `while` 循环据此终止，避免死循环）。
+    fn steal_releasing_voice_group(&mut self, ignored_id: usize) -> bool {
         if self.buffer.is_empty() {
-            return;
+            return false;
         }
 
-        // 一次遍历选出：T1 = release 中的最轻组；T2 = 全体最轻组（并列取最老）。
+        // 只从 release 中的组里选最轻者（并列取最老——从队首迭代、严格小于保持首个）。
         let mut releasing: Option<(usize, usize, u8)> = None; // (index, id, vel)
-        let mut quietest: Option<(usize, usize, u8)> = None;
         for (i, voice) in self.buffer.iter().enumerate() {
             if voice.id == ignored_id || voice.is_killed() {
                 continue;
@@ -145,13 +146,10 @@ impl VoiceBuffer {
             if voice.is_releasing() && releasing.is_none_or(|(_, _, v)| vel < v) {
                 releasing = Some((i, voice.id, vel));
             }
-            if quietest.is_none_or(|(_, _, v)| vel < v) {
-                quietest = Some((i, voice.id, vel));
-            }
         }
 
-        let Some((victim_index, victim_id, _)) = releasing.or(quietest) else {
-            return;
+        let Some((victim_index, victim_id, _)) = releasing else {
+            return false;
         };
 
         // 组大小 = 该 id 在选中下标处连续出现的个数（同一次 NoteOn 的声部共用 id）。
@@ -169,6 +167,7 @@ impl VoiceBuffer {
         if let Some(index) = self.held_by_damper.iter().position(|&x| x == victim_id) {
             self.held_by_damper.remove(index);
         }
+        true
     }
 
     fn kill_voice_fade_out(&mut self, index: usize) {
@@ -230,18 +229,19 @@ impl VoiceBuffer {
 
         if let Some(max_voices) = max_voices {
             if len > max_voices {
-                self.pop_quietest_voice_group(id);
+                // 单次 push 就超过上限：仍只从已有释放组里回收；没有则不动作。
+                self.steal_releasing_voice_group(id);
             } else {
                 // 上限按**活跃**（未被 Kill）组计，而不是 buffer 长度：被 Kill 的组正在
-                // 1ms 淡出，若按 buffer 长度计会导致每次 push 都叠加额外抢占
+                // 淡出，若按 buffer 长度计会导致每次 push 都叠加额外抢占
                 // （淡出保留 → buffer 变长 → 再抢一个 → 再淡出 ……）。
-                while self.get_active_count() > max_voices {
-                    self.pop_quietest_voice_group(id);
+                // 只杀释放中声部；无释放组时立即停手（持续音不偷，允许暂时超限）。
+                while self.get_active_count() > max_voices && self.steal_releasing_voice_group(id) {
                 }
             }
 
             // 淡出保留上限：防止被杀 voice 在事件积压时无界累积，导致
-            // `get_active_count` / `pop_quietest_voice_group` 的全 buffer 扫描
+            // `get_active_count` / `steal_releasing_voice_group` 的全 buffer 扫描
             // 在单个渲染块内退化为 O(n²)。每键上限的抢占现在**始终**走淡出，
             // 因此这一步必须无条件执行（不再依赖 `fade_out_killing`）。
             self.trim_excess_fading_voices(max_voices);
@@ -250,9 +250,10 @@ impl VoiceBuffer {
 
     /// 将被杀（淡出中）voice 的数量裁剪到 `fading_retention_limit` 以内。
     ///
-    /// 丢弃顺序：**从最老（队首）开始**——它们最接近淡出结束（1ms 淡出 ≈ 块内即完成），
-    /// 硬截的听感代价最小。历史实现在此处保留了最老的、丢弃最新的，等于把刚开始
-    /// 淡出（电平仍高）的 voice 直接抹掉 —— 又一次采样级不连续。
+    /// 丢弃顺序：**从最老（队首）开始**——它们最接近淡出结束（`KILL_FADE_SECS`
+    /// 淡出小于一个渲染块），硬截的听感代价最小。历史实现在此处保留了最老的、
+    /// 丢弃最新的，等于把刚开始淡出（电平仍高）的 voice 直接抹掉 —— 又一次
+    /// 采样级不连续。
     fn trim_excess_fading_voices(&mut self, max_voices: usize) {
         let limit = fading_retention_limit(max_voices);
         // 快速路径：buffer 未超过「active 上限 + 淡出保留上限」时无需扫描。
@@ -514,6 +515,42 @@ mod tests {
         );
     }
 
+    /// 推入一组指定释放状态的 mock 声部（REND-009：只有释放组才是可回收对象）。
+    fn push_one_state(buffer: &mut VoiceBuffer, velocity: u8, max_voices: usize, releasing: bool) {
+        let mut voice = MockVoice::new(velocity);
+        voice.releasing = releasing;
+        buffer.push_voices(
+            std::iter::once(Box::new(voice) as Box<dyn Voice>),
+            Some(max_voices),
+        );
+    }
+
+    #[test]
+    fn layer_cap_never_steals_sustained_voices() {
+        // REND-009 决策：每键上限**只回收释放中的尾巴**；持音（按键/踏板挂起）
+        // 永不被抢占——允许暂时超限，避免"长音没弄完就被松开"。
+        let mut buffer = VoiceBuffer::new(
+            Arc::new(AtomicU64::new(0)),
+            ChannelInitOptions {
+                fade_out_killing: false,
+                max_voices: None,
+            },
+        );
+        for velocity in [10u8, 20, 30, 40, 50] {
+            push_one(&mut buffer, velocity, 2);
+        }
+        assert_eq!(
+            buffer.get_active_count(),
+            5,
+            "持续音不得被每键上限抢占（允许暂时超限，待自然释放后回落）"
+        );
+        assert_eq!(
+            buffer.buffer.iter().filter(|g| g.voice.is_killed()).count(),
+            0,
+            "没有释放组时不得产生任何 Kill"
+        );
+    }
+
     #[test]
     fn fade_killing_retains_at_most_limit_killed_voices() {
         // 回归：高密度 NoteOn（模拟事件积压排空）下，被杀 voice 的保留量必须有界，
@@ -528,7 +565,8 @@ mod tests {
         );
         let max_voices = 2usize;
         for i in 0..1000u32 {
-            push_one(&mut buffer, (i % 127 + 1) as u8, max_voices);
+            // REND-009：只有释放中的组可被每键上限回收；用全释放组验证保留量有界。
+            push_one_state(&mut buffer, (i % 127 + 1) as u8, max_voices, true);
             let limit = fading_retention_limit(max_voices);
             assert!(
                 buffer.buffer.len() <= max_voices + limit,
@@ -559,9 +597,9 @@ mod tests {
                 max_voices: None,
             },
         );
-        push_one(&mut buffer, 10, 2);
-        push_one(&mut buffer, 20, 2);
-        push_one(&mut buffer, 30, 2); // 触发一次偷声（最轻的 10 被淡出）
+        push_one_state(&mut buffer, 10, 2, true);
+        push_one_state(&mut buffer, 20, 2, true);
+        push_one_state(&mut buffer, 30, 2, true); // 触发一次偷声（最轻的 10 释放尾音被淡出）
         assert_eq!(buffer.buffer.len(), 3, "被杀 voice 应保留在 buffer 中淡出");
         assert_eq!(buffer.get_active_count(), 2, "活跃 voice 应被限制为 2");
     }
@@ -569,8 +607,9 @@ mod tests {
     #[test]
     fn layer_cap_steal_is_faded_even_without_fade_out_killing() {
         // 回归（用户症状「长音无法完整播放、音符被直接杀掉」）：
-        // `fade_out_killing = false` 时，每键上限抢占**也必须**走 1ms 淡出。
-        // 历史实现走 `buffer.drain()` 零淡出硬切 = 采样级不连续（click）。
+        // `fade_out_killing = false` 时，每键上限抢占**也必须**走 Kill 淡出
+        // （REND-009 起为 5ms）。历史实现走 `buffer.drain()` 零淡出硬切 =
+        // 采样级不连续（click）。
         let counter = Arc::new(AtomicU64::new(0));
         let mut buffer = VoiceBuffer::new(
             counter.clone(),
@@ -581,7 +620,8 @@ mod tests {
         );
         let max_voices = 2usize;
         for _ in 0..100 {
-            push_one(&mut buffer, 50, max_voices);
+            // 全释放组：上限回收这些尾巴，验证 Kill 淡出路径与保留量有界。
+            push_one_state(&mut buffer, 50, max_voices, true);
         }
 
         assert_eq!(
@@ -612,8 +652,8 @@ mod tests {
 
     #[test]
     fn layer_cap_steal_protects_held_notes_and_takes_releasing_tail() {
-        // 保护持音：同键重复触发时，优先抢「已在 release 的尾巴」，
-        // 不能因为「最轻」而先把按住不放的长音（低力度）杀掉。
+        // REND-009：每键上限只回收 release 中的尾巴；持音（含低力度长音）
+        // 永不被抢占——无释放尾巴时允许暂时超限。
         let mut buffer = VoiceBuffer::new(
             Arc::new(AtomicU64::new(0)),
             ChannelInitOptions {

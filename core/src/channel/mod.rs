@@ -865,10 +865,12 @@ mod batch_render_tests {
             None,
         );
 
-        // 按住的长音（低力度 → 若不保护，会因"最轻"被优先抢走）。
-        channel.key_voices[0]
-            .data
-            .push_voice_test_capped(batch_voice_noloop(0.4, 10), MAX_LAYERS);
+        // 先推满 4 组持音（低力度 10 → 旧的"最轻者优先"策略会先杀它们）。
+        for _ in 0..MAX_LAYERS {
+            channel.key_voices[0]
+                .data
+                .push_voice_test_capped(batch_voice_noloop(0.4, 10), MAX_LAYERS);
+        }
 
         let mut buf = vec![0.0f32; FRAMES * 2];
         let mut prev = (0.0f32, 0.0f32);
@@ -877,9 +879,31 @@ mod batch_render_tests {
         let calm_step = max_step_same_channel(&buf, prev);
         prev = last_frame(&buf);
 
-        // 同键再触发 MAX_LAYERS 次：第 4 次会让活跃数超过上限 → 触发抢占。
-        let mut steal_step = 0.0f32;
-        for _ in 0..MAX_LAYERS {
+        // REND-009：把其中一组切到 release，制造可被上限回收的"释放尾巴"；
+        // 立刻再推一组（活跃 5 > 上限 4）触发回收。渲染前取证被 Kill 的组
+        // （5ms 淡出会在后续块内完成并被移除）。
+        channel.key_voices[0]
+            .data
+            .iter_voices_mut()
+            .next()
+            .expect("已推入 4 组持音")
+            .signal_release(ReleaseType::Standard);
+        channel.key_voices[0]
+            .data
+            .push_voice_test_capped(batch_voice_noloop(0.4, 100), MAX_LAYERS);
+        let killed_velocities: Vec<u8> = channel.key_voices[0]
+            .data
+            .iter_voices_mut()
+            .filter(|v| v.is_killed())
+            .map(|v| v.velocity())
+            .collect();
+        buf.fill(0.0);
+        channel.render_batched(&mut buf);
+        let mut steal_step = max_step_same_channel(&buf, prev);
+        prev = last_frame(&buf);
+
+        // 其余 push：没有释放尾巴可回收 → 不得产生新 Kill（持续音不偷）。
+        for _ in 1..MAX_LAYERS {
             channel.key_voices[0]
                 .data
                 .push_voice_test_capped(batch_voice_noloop(0.4, 100), MAX_LAYERS);
@@ -892,11 +916,16 @@ mod batch_render_tests {
         assert!(
             steal_step < 0.03,
             "抢占块出现了采样级硬切：steal_step={steal_step}（calm_step={calm_step}）\
-             —— 每键上限抢占必须走 1ms 淡出"
+             —— 抢占必须走 5ms 淡出"
+        );
+        assert_eq!(
+            killed_velocities,
+            vec![10],
+            "被回收的只能是释放中的尾巴（vel=10）；持续音不得被抢占"
         );
         assert!(
-            channel.key_voices[0].data.active_voice_count() <= MAX_LAYERS,
-            "每键活跃声部上限必须维持"
+            channel.key_voices[0].data.active_voice_count() >= MAX_LAYERS,
+            "持续音允许暂时超过每键上限（上限语义 = 释放尾音预算）"
         );
     }
     #[test]

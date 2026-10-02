@@ -457,7 +457,10 @@ impl<T: Simd> VoiceGeneratorBase for SIMDVoiceEnvelope<T> {
         if rel_type == ReleaseType::Kill {
             self.params.modify_stage_data(
                 5,
-                EnvelopePart::lerp(0.0, (0.001 * self.sample_rate) as u32),
+                EnvelopePart::lerp(
+                    0.0,
+                    (crate::voice::KILL_FADE_SECS * self.sample_rate) as u32,
+                ),
             );
             self.update_stage();
             self.killed = true;
