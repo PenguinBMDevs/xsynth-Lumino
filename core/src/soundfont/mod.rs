@@ -406,7 +406,20 @@ impl SampleSoundfont {
     ) -> Result<Self, Sf2ParseError> {
         let presets =
             xsynth_soundfonts::sf2::load_soundfont(sf2_path.into(), stream_params.sample_rate)?;
+        Ok(Self::from_presets(presets, stream_params, options))
+    }
 
+    /// Builds a soundfont from an already parsed SF2 preset list.
+    ///
+    /// Lets callers that cache `xsynth_soundfonts::sf2::load_soundfont` results
+    /// (e.g. a process-wide soundfont cache) avoid parsing/resampling the same
+    /// file twice. `Sf2Preset` keeps its sample buffers as `Arc`s, so the
+    /// caller and this soundfont share one copy of the sample data.
+    pub fn from_presets(
+        presets: Vec<xsynth_soundfonts::sf2::Sf2Preset>,
+        stream_params: AudioStreamParams,
+        options: SoundfontInitOptions,
+    ) -> Self {
         let mut instruments = Vec::new();
 
         for preset in presets {
@@ -519,10 +532,10 @@ impl SampleSoundfont {
             instruments.push(new);
         }
 
-        Ok(SampleSoundfont {
+        SampleSoundfont {
             instruments,
             stream_params,
-        })
+        }
     }
 }
 
