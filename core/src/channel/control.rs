@@ -37,6 +37,21 @@ impl ValueLerp {
         }
         self.current
     }
+
+    /// 插值是否已静止（当前值 == 目标值）：此时 `get_next` 恒返回同一值。
+    ///
+    /// 用于 `apply_channel_effects` 的整块快路径：静止时每样本的增益/声像
+    /// 完全相同，可把 `powi`/`cos`/`sin` 从「每样本」降为「每块一次」。
+    #[inline(always)]
+    pub fn is_static(&self) -> bool {
+        self.end == self.current
+    }
+
+    /// 只读当前值（不推进插值）；静止时与 `get_next` 等价。
+    #[inline(always)]
+    pub fn peek(&self) -> f32 {
+        self.current
+    }
 }
 
 pub(super) struct ControlEventData {
@@ -369,7 +384,10 @@ mod tests {
         channel.control_event_data.pitch_bend_value = f32::NAN;
         channel.process_pitch();
         assert!(
-            channel.voice_control_data.voice_pitch_multiplier.is_finite()
+            channel
+                .voice_control_data
+                .voice_pitch_multiplier
+                .is_finite()
                 && channel.voice_control_data.voice_pitch_multiplier > 0.0,
             "NaN 控制应回落到基准音高"
         );

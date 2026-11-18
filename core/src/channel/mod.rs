@@ -170,29 +170,57 @@ impl VoiceChannel {
     fn apply_channel_effects(&mut self, out: &mut [f32]) {
         let control = &mut self.control_event_data;
 
+        // 静止快路径：volume/expression/pan 插值已收敛时，每样本的值完全相同，
+        // 可把 powi/cos/sin 从「每样本」降为「每块一次」。逐位等价（静止时
+        // `get_next` 恒返回 `peek` 值，乘法顺序不变）。
         match self.stream_params.channels {
             ChannelCount::Mono => {
                 // Volume
-                for sample in out.iter_mut() {
-                    let vol = control.volume.get_next() * control.expression.get_next();
-                    let vol = vol.powi(2);
-                    *sample *= vol;
+                if control.volume.is_static() && control.expression.is_static() {
+                    let vol = (control.volume.peek() * control.expression.peek()).powi(2);
+                    for sample in out.iter_mut() {
+                        *sample *= vol;
+                    }
+                } else {
+                    for sample in out.iter_mut() {
+                        let vol = control.volume.get_next() * control.expression.get_next();
+                        let vol = vol.powi(2);
+                        *sample *= vol;
+                    }
                 }
             }
             ChannelCount::Stereo => {
                 // Volume
-                for sample in out.chunks_mut(2) {
-                    let vol = control.volume.get_next() * control.expression.get_next();
-                    let vol = vol.powi(2);
-                    sample[0] *= vol;
-                    sample[1] *= vol;
+                if control.volume.is_static() && control.expression.is_static() {
+                    let vol = (control.volume.peek() * control.expression.peek()).powi(2);
+                    for sample in out.chunks_mut(2) {
+                        sample[0] *= vol;
+                        sample[1] *= vol;
+                    }
+                } else {
+                    for sample in out.chunks_mut(2) {
+                        let vol = control.volume.get_next() * control.expression.get_next();
+                        let vol = vol.powi(2);
+                        sample[0] *= vol;
+                        sample[1] *= vol;
+                    }
                 }
 
                 // Pan
-                for sample in out.chunks_mut(2) {
-                    let pan = control.pan.get_next();
-                    sample[0] *= ((pan * std::f32::consts::PI / 2.0).cos()).min(1.0);
-                    sample[1] *= ((pan * std::f32::consts::PI / 2.0).sin()).min(1.0);
+                if control.pan.is_static() {
+                    let pan = control.pan.peek();
+                    let left = ((pan * std::f32::consts::PI / 2.0).cos()).min(1.0);
+                    let right = ((pan * std::f32::consts::PI / 2.0).sin()).min(1.0);
+                    for sample in out.chunks_mut(2) {
+                        sample[0] *= left;
+                        sample[1] *= right;
+                    }
+                } else {
+                    for sample in out.chunks_mut(2) {
+                        let pan = control.pan.get_next();
+                        sample[0] *= ((pan * std::f32::consts::PI / 2.0).cos()).min(1.0);
+                        sample[1] *= ((pan * std::f32::consts::PI / 2.0).sin()).min(1.0);
+                    }
                 }
             }
         }
