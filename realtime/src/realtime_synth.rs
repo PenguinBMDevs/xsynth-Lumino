@@ -362,14 +362,10 @@ impl RealtimeSynth {
         let sample_rate = stream_config.sample_rate().0;
         let stream_params = AudioStreamParams::new(sample_rate, stream_config.channels().into());
         let channel_pool = build_channel_pool(config.multithreading)?;
-        // B1 批渲染闸门：只有「通道内不启用 key 级线程池」时才允许批渲染。
-        // 否则会出现「spawner 造了批 voice、但通道无法批渲染 → 退回逐帧标量 lane」
-        // 的错配（标量 lane 比原 SIMD 链慢）。`ThreadCount::None` 是绝大多数机器
-        // （逻辑核 ≤ 16）的默认策略，此时启用批渲染。
-        xsynth_core::voice::set_batch_render_available(matches!(
-            config.multithreading,
-            ThreadCount::None
-        ));
+        // B1 批渲染闸门：key 池存在时通道走「key 分组批渲染」——每组负责一段连续
+        // key，组内仍跨 key 收集批 lane，不会再出现「批 voice 只能标量回退」的错配。
+        // 因此无论是否启用 key 池，都允许批渲染。
+        xsynth_core::voice::set_batch_render_available(true);
         let channel_count = channel_count(config.format);
 
         // 每通道音频域混音状态（增益/声像），索引 = MIDI 通道号。

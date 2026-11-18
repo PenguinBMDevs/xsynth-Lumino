@@ -1,4 +1,4 @@
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{atomic::AtomicU64, Arc, OnceLock};
 
 use crate::{
     effects::MultiChannelBiQuad,
@@ -42,6 +42,21 @@ impl Key {
             event_cache: Vec::new(),
         }
     }
+}
+
+/// key 分组批渲染的组数（`LUMINO_BATCH_GROUPS`，默认 8）。
+///
+/// 组太少填不满多核，组太多增加任务与收集开销。默认 8：16 通道 × 8 = 128 个任务，
+/// 128 key 每组 16 个 key，批 lane 收集长度足够；实测 8 组在负载均衡与开销间最优。
+fn batch_group_count() -> usize {
+    static GROUPS: OnceLock<usize> = OnceLock::new();
+    *GROUPS.get_or_init(|| {
+        std::env::var("LUMINO_BATCH_GROUPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(8)
+    })
 }
 
 /// Options for initializing a new VoiceChannel.
@@ -105,6 +120,10 @@ pub struct VoiceChannel {
     params: VoiceChannelParams,
     threadpool: Option<Arc<rayon::ThreadPool>>,
 
+    /// key 分组批渲染的每组输出缓冲（扁平存储：`groups × block_len`）。
+    /// 仅在 `threadpool.is_some()` 且批渲染可用时使用；跨块复用，避免每块分配。
+    batch_group_bufs: Vec<f32>,
+
     stream_params: AudioStreamParams,
 
     /// Channel configuration (fade-out kills, per-channel voice cap).
@@ -142,9 +161,13 @@ impl VoiceChannel {
         }
 
         let mut params = VoiceChannelParams::new(stream_params);
-        // 批 voice 只在「无 key 级线程池」的单线程批渲染路径有收益；并行 key 渲染下
-        // 跨 key 批内核不可用，批 voice 只能标量回退（实测并行 realtime_x 4.2 → 4.6）。
-        params.channel_sf.set_batch_voices(threadpool.is_none());
+        // 批 voice 的启用条件：立体声 + SIMD 宽度足够 + 宿主闸门允许。
+        // - 无 key 池：单线程整通道批渲染；
+        // - 有 key 池：key 分组批渲染（每组 ≥ 1 个 key，跨 key 收集批 lane）。
+        // 两者都要求构造批 voice；不满足时构造链式 voice，避免标量回退。
+        params.channel_sf.set_batch_voices(
+            crate::voice::batching_supported() && stream_params.channels == ChannelCount::Stereo,
+        );
         let shared_voice_counter = params.stats.voice_counter.clone();
 
         VoiceChannel {
@@ -152,6 +175,7 @@ impl VoiceChannel {
             key_voices: fill_key_array(|i| Key::new(i, shared_voice_counter.clone(), options)),
 
             threadpool,
+            batch_group_bufs: Vec::new(),
 
             stream_params,
 
@@ -283,8 +307,13 @@ impl VoiceChannel {
         crate::profiling::tracy_zone!("channel_keys", {
             // B1 批渲染：仅在单线程（无 key 级线程池）且立体声、SIMD 宽度足够时启用。
             if self.batched_render_enabled() {
+                let pool = self.threadpool.clone();
                 crate::profiling::tracy_zone!("ch_keys_render", {
-                    self.render_batched(out);
+                    match pool.as_ref() {
+                        // key 池存在：把 128 个 key 切成若干组并行批渲染，再归约组缓冲。
+                        Some(pool) => self.render_batched_groups(pool, out),
+                        None => self.render_batched(out),
+                    }
                 });
                 crate::profiling::tracy_zone!("channel_effects", {
                     self.apply_channel_effects(out);
@@ -325,21 +354,53 @@ impl VoiceChannel {
         });
     }
 
-    /// B1 批渲染是否可用：`LUMINO_BATCH`（默认开）+ 无 key 级线程池（只有单线程渲染才能
-    /// 跨 key 收集连续的可批 lane）+ 立体声输出 + SIMD 宽度足够。
+    /// B1 批渲染是否可用：立体声输出 + SIMD 宽度足够 + 宿主闸门允许。
+    /// 无论是否有 key 级线程池都可用：无池走整通道批，有池走 key 分组批。
     fn batched_render_enabled(&self) -> bool {
-        self.threadpool.is_none()
-            && self.stream_params.channels == ChannelCount::Stereo
-            && crate::voice::batching_supported()
+        self.stream_params.channels == ChannelCount::Stereo && crate::voice::batching_supported()
     }
 
-    /// 跨 key 批渲染。
+    /// 跨 key 批渲染（整通道，单线程）。
+    fn render_batched(&mut self, out: &mut [f32]) {
+        Self::render_batched_keys(&mut self.key_voices, out);
+    }
+
+    /// key 分组并行批渲染：每组负责一段连续 key，写独立 buffer，最后归约。
+    ///
+    /// 目标是同时拿到「批内核的每 voice 效率」和「key 级负载均衡」：
+    /// 单通道 16 个通道任务用不满 24 核，且各通道声部数不均（实测 1.2%~16.3%）。
+    /// 组内仍跨 key 收集连续批 lane；组间求和顺序变化只产生 ulp 级差异（项目允许）。
+    fn render_batched_groups(&mut self, pool: &rayon::ThreadPool, out: &mut [f32]) {
+        let len = out.len();
+        let key_count = self.key_voices.len();
+        let groups = batch_group_count().min(key_count).max(1);
+        let chunk = key_count.div_ceil(groups).max(1);
+        let actual = key_count.div_ceil(chunk);
+        prepapre_cache_vec(&mut self.batch_group_bufs, actual * len, 0.0);
+
+        let keys = &mut self.key_voices;
+        let bufs = &mut self.batch_group_bufs;
+        pool.install(|| {
+            keys.par_chunks_mut(chunk)
+                .zip(bufs.par_chunks_mut(len))
+                .for_each(|(keys, buf)| {
+                    buf.fill(0.0);
+                    Self::render_batched_keys(keys, buf);
+                });
+        });
+
+        out.fill(0.0);
+        for buf in self.batch_group_bufs.chunks(len) {
+            sum_simd(buf, out);
+        }
+    }
+
+    /// 跨 key 批渲染（给定 key 切片）。
     ///
     /// 遍历「key 顺序 → key 内 voice 顺序」的扁平序列（与 `LUMINO_BATCH=0` 的
     /// 渲染顺序一致），把连续的可批 voice 按运行时 SIMD 宽度分块交给批内核；
-    /// 前导/后继/孤立（不足一个 chunk）的 voice 仍逐 voice 渲染，因此逐 voice
-    /// 的累加顺序不变（批内 lane 之间为树形求和，见 `voice/batch.rs`）。
-    fn render_batched(&mut self, out: &mut [f32]) {
+    /// 前导/后继/孤立（不足一个 chunk）的 voice 仍逐 voice 渲染。
+    fn render_batched_keys(keys: &mut [Key], out: &mut [f32]) {
         let frames = out.len() / 2;
         let width = crate::voice::batch_chunk_width();
         {
@@ -347,8 +408,7 @@ impl VoiceChannel {
             // 粒度只在块级，不进入每帧 DSP 内核，避免 trace 爆炸与时序失真。
             let mut all: Vec<&mut Box<dyn Voice>> =
                 crate::profiling::tracy_zone!("b_collect_voices", {
-                    self.key_voices
-                        .iter_mut()
+                    keys.iter_mut()
                         .flat_map(|key| key.data.iter_voices_mut())
                         .collect()
                 });
@@ -405,7 +465,7 @@ impl VoiceChannel {
         }
 
         crate::profiling::tracy_zone!("b_remove_ended", {
-            for key in self.key_voices.iter_mut() {
+            for key in keys.iter_mut() {
                 if key.data.has_voices() {
                     key.data.remove_ended_voices();
                 }
