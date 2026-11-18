@@ -9,6 +9,10 @@
 //! - layers: 每键声部上限（默认 2，模拟 Lumino app）；0 = 不限制
 //! - parallel: 0 = 单线程批渲染（默认）；1 = 通道+key 双线程池（app 实时配置）；
 //!   2 = 仅通道池（每通道内可批渲染）；3 = 仅 key 池
+//!
+//! 固定音频窗口（A/B 用）：环境变量 `XSYNTH_BENCH_START`（秒）+ `XSYNTH_BENCH_AUDIO`（秒）。
+//! 只对窗口内的渲染计时；窗口之前照常渲染以保持声部状态。统一黑 MIDI 前 65s 近乎静音，
+//! wall 截止会让不同跑次落在不同音频位置，负载不可比——并行 A/B 必须走固定窗口。
 
 use std::{sync::Arc, time::Instant};
 
@@ -98,24 +102,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quantum_s = 0.01f64;
     let quantum_samples = (sample_rate as f64 * quantum_s) as usize * 2;
     let mut buffer = vec![0.0f32; quantum_samples];
+
+    // 固定音频窗口（A/B 口径）：从 `XSYNTH_BENCH_START` 秒起渲染 `XSYNTH_BENCH_AUDIO` 秒，
+    // 只对窗口计时。原因：统一黑 MIDI 前 65s 近乎静音（~3k notes），wall 截止会让
+    // 不同跑次停在不同音频位置（实测 events 从 9k 到 1.1M 波动 100 倍），负载不可比。
+    // 窗口之前的音频照常渲染（保持声部状态），但不计入耗时。
+    let start_audio: f64 = std::env::var("XSYNTH_BENCH_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let fixed_audio: Option<f64> = std::env::var("XSYNTH_BENCH_AUDIO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|s| *s > 0.0);
+
     let mut pending = 0.0f64;
     let t0 = Instant::now();
     let (mut blocks, mut events, mut audio_secs) = (0u64, 0u64, 0.0f64);
+    let mut sim_time = 0.0f64;
+    let mut window_start: Option<Instant> = None;
+    let (mut window_audio, mut window_blocks, mut window_events) = (0.0f64, 0u64, 0u64);
+    let mut truncated = false;
 
-    println!("Rendering (max {max_seconds}s wall, layers={layers:?}, parallel={parallel})...");
-    for batch in merged {
+    println!(
+        "Rendering (max {max_seconds}s wall, layers={layers:?}, parallel={parallel}, \
+         window={start_audio:.1}s+{fixed_audio:?})..."
+    );
+    'outer: for batch in merged {
         if t0.elapsed().as_secs_f64() >= max_seconds {
+            truncated = true;
             break;
         }
         // 先消化到本批事件的时间间隔（拉取式渲染，与 offline renderer 一致）。
         pending += batch.delta.max(0.0);
         while pending >= quantum_s {
+            if fixed_audio.is_some() && window_start.is_none() && sim_time >= start_audio {
+                window_start = Some(Instant::now());
+            }
             synth.read_samples(&mut buffer);
             pending -= quantum_s;
+            sim_time += quantum_s;
             audio_secs += quantum_s;
             blocks += 1;
+            if window_start.is_some() {
+                window_audio += quantum_s;
+                window_blocks += 1;
+            }
+            if let Some(dur) = fixed_audio {
+                if sim_time >= start_audio + dur {
+                    break 'outer;
+                }
+            }
             if t0.elapsed().as_secs_f64() >= max_seconds {
-                break;
+                truncated = true;
+                break 'outer;
             }
         }
 
@@ -153,14 +193,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             synth.send_event(SynthEvent::Channel(channel, event));
             events += 1;
+            if window_start.is_some() {
+                window_events += 1;
+            }
         }
     }
 
     let elapsed = t0.elapsed().as_secs_f64();
+    let (measured_audio, measured_elapsed) = match window_start {
+        Some(t) => (window_audio, t.elapsed().as_secs_f64()),
+        None => (audio_secs, elapsed),
+    };
     println!(
-        "DONE wall={elapsed:.3}s audio={audio_secs:.2}s blocks={blocks} events={events} \
-         realtime_x={:.2} voices={}",
-        audio_secs / elapsed,
+        "DONE total_wall={elapsed:.3}s audio={audio_secs:.2}s blocks={blocks} events={events} \
+         window_audio={measured_audio:.2}s window_blocks={window_blocks} \
+         window_events={window_events} window_wall={measured_elapsed:.3}s \
+         realtime_x={:.2} voices={} truncated={truncated}",
+        measured_audio / measured_elapsed,
         synth.voice_count()
     );
     Ok(())
