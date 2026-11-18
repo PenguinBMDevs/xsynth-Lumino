@@ -28,8 +28,12 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     speed_mult: f32,
     filter: Option<BiQuadFilter>,
     loop_params: LoopParams,
-    amp: f32,
-    pan: f32,
+    /// spawn 期常量：力度 amp 与等功率声像增益合成的立体声增益。
+    ///
+    /// `pan`/`amp` 在 spawner 生命周期内固定，cos/sin 只取决于它们——预计算到
+    /// 构造期，避免每次 spawn 重算两次三角函数。数值与 `stereo_gains()` 逐位相同。
+    gain_l: f32,
+    gain_r: f32,
     volume_envelope_params: Arc<EnvelopeParameters>,
     samples: Arc<[Arc<[f32]>]>,
     interpolator: Interpolator,
@@ -58,12 +62,17 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             )
         });
 
+        // 预计算立体声增益（与 `stereo_gains()` 同一公式与运算顺序）。
+        let pan_rad = params.pan * std::f32::consts::PI / 2.0;
+        let gain_l = (pan_rad.cos() * 1.42).min(1.0) * amp;
+        let gain_r = (pan_rad.sin() * 1.42).min(1.0) * amp;
+
         Self {
             speed_mult: params.speed_mult,
             filter,
             loop_params: params.loop_params.clone(),
-            amp,
-            pan: params.pan,
+            gain_l,
+            gain_r,
             volume_envelope_params: params.envelope.clone(),
             samples: params.sample.clone(),
             interpolator: params.interpolator,
@@ -83,7 +92,15 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             crate::voice_probe::record_voice_kind(self.filter.is_some());
         }
         let batch = self.batch_voices && !probe && crate::voice::batching_supported();
-        self.begin_voice_impl(control, batch, probe)
+        // Tracy 阶段打点只在被采样 voice（1/N）上发射：整条构造链只测 1/N 个样本，
+        // zone 自身开销不污染测量值，样本仍均匀代表全体。
+        if probe {
+            crate::profiling::tracy_zone!("spawn_one_voice", {
+                self.begin_voice_impl(control, batch, probe)
+            })
+        } else {
+            self.begin_voice_impl(control, batch, probe)
+        }
     }
 
     /// 构造 voice。`batch = true` 时优先构造 B1 批处理 voice（lane 即权威状态），
@@ -104,7 +121,13 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
 
         // Currently there's only the f32 buffer samples, more could be added in the future.
         #[allow(clippy::redundant_closure)]
-        self.make_sample_reader(control, |s| BufferSamplers::new_f32(s), probe)
+        let make =
+            |probe: bool| self.make_sample_reader(control, |s| BufferSamplers::new_f32(s), probe);
+        if probe {
+            crate::profiling::tracy_zone!("spawn_reader", { make(true) })
+        } else {
+            make(false)
+        }
     }
 
     /// B1：构造可批 voice。`LUMINO_BATCH=0`、宿主闸门关闭或 SIMD 宽度不足时
@@ -200,11 +223,11 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     ///
     /// 原实现是 `amp`（单声道常量乘）+ 声像增益（立体声乘）两层 `SIMDVoiceCombine`，
     /// 组合链上每层每 8 帧都要走一遍嵌套 next_sample；两者都是常量，相乘是等价的。
+    ///
+    /// 值在 spawner 构造期预计算（`pan`/`amp` 固定），每次 spawn 免去两次三角函数。
+    #[inline(always)]
     fn stereo_gains(&self) -> (f32, f32) {
-        let pan = self.pan * std::f32::consts::PI / 2.0;
-        let left = (pan.cos() * 1.42).min(1.0) * self.amp;
-        let right = (pan.sin() * 1.42).min(1.0) * self.amp;
-        (left, right)
+        (self.gain_l, self.gain_r)
     }
 
     fn apply_gain<Gen>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, SIMDSampleStereo<S>>
@@ -235,8 +258,9 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
         Gen: SIMDVoiceGenerator<S, Sample>,
     {
+        // 直接解引用拷贝（`EnvelopeParameters: Copy`），避免一次 Arc::clone 原子操作。
         let modified_params = SIMDVoiceEnvelope::<S>::get_modified_envelope(
-            *self.volume_envelope_params.clone(),
+            *self.volume_envelope_params,
             control.envelope,
             self.stream_params.sample_rate as f32,
         );
@@ -262,6 +286,19 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let flattened = SIMDStereoVoice::new(gen, probe);
         let base = VoiceBase::new(self.vel, self.exclusive_class(), flattened);
 
+        // 诊断：voice 结构体体积（一次性输出，用于判断 Box 分配/拷贝成本）。
+        #[cfg(feature = "voice_probe")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[SPAWN SIZE] voice base = {} bytes",
+                    std::mem::size_of_val(&base)
+                );
+            }
+        }
+
         if probe {
             Box::new(crate::voice_probe::ProbeVoice::new(Box::new(base)))
         } else {
@@ -278,10 +315,25 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     where
         Gen: 'static + SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
     {
-        let gen = self.apply_gain(gen);
-        let gen = self.apply_envelope(gen, control, probe);
+        // 同 `begin_voice`：只在被采样 voice 上发射阶段 zone（1/N 采样）。
+        let gen = if probe {
+            crate::profiling::tracy_zone!("spawn_gain", { self.apply_gain(gen) })
+        } else {
+            self.apply_gain(gen)
+        };
+        let gen = if probe {
+            crate::profiling::tracy_zone!("spawn_envelope", {
+                self.apply_envelope(gen, control, probe)
+            })
+        } else {
+            self.apply_envelope(gen, control, probe)
+        };
 
-        self.apply_cutoff_effect(gen, probe)
+        if probe {
+            crate::profiling::tracy_zone!("spawn_box", { self.apply_cutoff_effect(gen, probe) })
+        } else {
+            self.apply_cutoff_effect(gen, probe)
+        }
     }
 
     fn apply_cutoff_effect(
@@ -401,8 +453,8 @@ mod tests {
                 end: 3_000,
                 stop: None,
             },
-            amp,
-            pan: 0.3,
+            gain_l: ((0.3f32 * std::f32::consts::PI / 2.0).cos() * 1.42).min(1.0) * amp,
+            gain_r: ((0.3f32 * std::f32::consts::PI / 2.0).sin() * 1.42).min(1.0) * amp,
             volume_envelope_params: Arc::new(descriptor().to_envelope_params(SR, options)),
             samples: Arc::new([sample_buffer(0.0), sample_buffer(1.7)]),
             interpolator,

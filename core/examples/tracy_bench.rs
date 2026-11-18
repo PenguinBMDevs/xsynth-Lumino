@@ -7,7 +7,8 @@
 //!
 //! - max_seconds: wall-clock 运行时上限（默认 25s），避免 4400 万音符跑不完
 //! - layers: 每键声部上限（默认 2，模拟 Lumino app）；0 = 不限制
-//! - parallel: 1 = 通道/键级线程池（app 实时配置，此时批渲染禁用）；0 = 单线程批渲染（默认）
+//! - parallel: 0 = 单线程批渲染（默认）；1 = 通道+key 双线程池（app 实时配置）；
+//!   2 = 仅通道池（每通道内可批渲染）；3 = 仅 key 池
 
 use std::{sync::Arc, time::Instant};
 
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(0) | None => Some(2),
         Some(n) => Some(n),
     };
-    let parallel = args.get(5).map(|s| s == "1").unwrap_or(false);
+    let parallel: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let sample_rate = 48000u32;
     let params = AudioStreamParams::new(sample_rate, ChannelCount::Stereo);
@@ -55,13 +56,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Default::default(),
     )?)];
 
-    let parallelism = if parallel {
-        ParallelismOptions::AUTO_PER_KEY
-    } else {
-        ParallelismOptions {
+    // parallel: 0=单线程（可批渲染） 1=通道+key 双池（app 配置） 2=仅通道池 3=仅 key 池
+    let parallelism = match parallel {
+        1 => ParallelismOptions::AUTO_PER_KEY,
+        2 => ParallelismOptions::AUTO_PER_CHANNEL,
+        3 => ParallelismOptions {
+            channel: ThreadCount::None,
+            key: ThreadCount::Auto,
+        },
+        _ => ParallelismOptions {
             channel: ThreadCount::None,
             key: ThreadCount::None,
-        }
+        },
     };
     let config = ChannelGroupConfig {
         channel_init_options: Default::default(),

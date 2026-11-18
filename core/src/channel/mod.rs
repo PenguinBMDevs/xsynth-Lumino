@@ -244,8 +244,14 @@ impl VoiceChannel {
 
             // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
             crate::profiling::tracy_zone!("ch_spawn_voices", {
+                #[cfg(feature = "tracy")]
+                let mut ev_count = 0u64;
                 for key in self.key_voices.iter_mut() {
                     for e in key.event_cache.drain(..) {
+                        #[cfg(feature = "tracy")]
+                        {
+                            ev_count += 1;
+                        }
                         key.data.send_event(
                             e,
                             &self.voice_control_data,
@@ -254,6 +260,9 @@ impl VoiceChannel {
                         );
                     }
                 }
+                // 工作量归一化：本块本通道的事件数（spawn 成本 / 事件数 = 单次事件成本）。
+                #[cfg(feature = "tracy")]
+                crate::profiling::tracy_plot!("ch_spawn_events", ev_count as f64);
             });
 
             // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
