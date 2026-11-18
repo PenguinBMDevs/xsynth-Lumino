@@ -596,10 +596,13 @@ impl HotLane {
     }
 
     /// 推进一帧采样（时间 → 索引 → 回绕 → 抓取/插值），返回滤波前的左右样本。
+    ///
+    /// `speed_f64` 由调用方在 chunk 起点预转换（`speed` 在 chunk 内恒定），
+    /// 热循环因此免去每帧 `f32 as f64`；数值与 `self.speed as f64` 完全一致。
     #[inline(always)]
-    fn sample_step(&mut self) -> (f32, f32) {
+    fn sample_step(&mut self, speed_f64: f64) -> (f32, f32) {
         let t = self.time;
-        self.time = t + self.speed as f64;
+        self.time = t + speed_f64;
         let index = t as i32;
         // `reader.get(pos)` 的入参（未回绕，含 offset）。
         let base_l = index as usize + self.off_l;
@@ -1116,6 +1119,12 @@ pub(crate) fn render_batch_chunk(
         };
         u32::from(tag)
     });
+    // 观测：uniform 专用内核命中率（1=走专用内核，0=回退通用内核）。
+    #[cfg(feature = "tracy")]
+    {
+        crate::profiling::tracy_plot!("dsp_uniform_hit", if uniform.is_some() { 1.0 } else { 0.0 });
+        crate::profiling::tracy_plot!("dsp_generic_hit", if uniform.is_none() { 1.0 } else { 0.0 });
+    }
     render(lanes, out, frames, uniform)
 }
 
@@ -1167,6 +1176,17 @@ fn render_inner<S: Simd, const MODE: u32>(
             hot_lanes[k] = lanes[k].hot();
         }
 
+        // 只读不变量预取（同 `render_uniform`）：speed 提前转 f64、gain 提到局部数组，
+        // 热循环免去每帧 `f32 as f64` 与结构体字段读取；值逐位不变。
+        let mut speeds = [0.0f64; MAX_LANES];
+        let mut gains_l = [0.0f32; MAX_LANES];
+        let mut gains_r = [0.0f32; MAX_LANES];
+        for k in 0..width {
+            speeds[k] = hot_lanes[k].speed as f64;
+            gains_l[k] = hot_lanes[k].gain_l;
+            gains_r[k] = hot_lanes[k].gain_r;
+        }
+
         for step in 0..frames {
             // 1) 标量：逐 lane 采样（+ 包络 + 增益，按消融档位）。
             unsafe {
@@ -1175,7 +1195,7 @@ fn render_inner<S: Simd, const MODE: u32>(
                     let (sl, sr) = if MODE == 4 {
                         hot.sample_step_flat()
                     } else {
-                        hot.sample_step()
+                        hot.sample_step(speeds[k])
                     };
                     let (l, r) = match MODE {
                         0 | 4 => (sl, sr),
@@ -1185,7 +1205,7 @@ fn render_inner<S: Simd, const MODE: u32>(
                         }
                         _ => {
                             let env = lanes.get_unchecked_mut(k).env.next_frame_simd::<S>();
-                            (env * (hot.gain_l * sl), env * (hot.gain_r * sr))
+                            (env * (gains_l[k] * sl), env * (gains_r[k] * sr))
                         }
                     };
                     *sl_arr.get_unchecked_mut(k) = l;
@@ -1364,6 +1384,18 @@ fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASE
             hot_lanes[k] = lanes[k].hot();
         }
 
+        // 只读不变量预取：speed/gain 在 chunk 内恒定（apply_hot 只回写 time/last），
+        // 提前转成 f64 / 提到局部数组，热循环免去每帧 f32→f64 转换与结构体字段读取。
+        // 运算值逐位不变。
+        let mut speeds = [0.0f64; MAX_LANES];
+        let mut gains_l = [0.0f32; MAX_LANES];
+        let mut gains_r = [0.0f32; MAX_LANES];
+        for k in 0..width {
+            speeds[k] = hot_lanes[k].speed as f64;
+            gains_l[k] = hot_lanes[k].gain_l;
+            gains_r[k] = hot_lanes[k].gain_r;
+        }
+
         // `last` 只在 chunk 边界被读取（`is_past_end` / 释放后外推），但需要每帧
         // 的未回绕位置，因此按帧写入热状态（无读取）。
         let track_last = MODE_TAG == HOT_MODE_SUSTAIN && !RELEASED;
@@ -1385,7 +1417,7 @@ fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASE
                 for k in 0..width {
                     let hot = hot_lanes.get_unchecked_mut(k);
                     let t = hot.time;
-                    hot.time = t + hot.speed as f64;
+                    hot.time = t + speeds[k];
                     let index = t as i32;
                     let base_l = index as usize + hot.off_l;
                     let base_r = index as usize + hot.off_r;
@@ -1397,42 +1429,36 @@ fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASE
                         hot.last_r = if LINEAR { base_r + 1 } else { base_r };
                     }
 
-                    let (pos_l, pos_r, pos_l1, pos_r1) = if RELEASED {
-                        let f = |base: usize, last: usize, end: usize| {
+                    // 位置计算收敛为单点：`LINEAR=false` 时只算本帧位置，不再额外计算
+                    // `index+1` 的独立回绕（旧实现用四元组一次性算 4 个位置，NEAREST
+                    // 分支下后两个是死值——`wrap_pos` 含 `%`，编译器不保证能消除）。
+                    let pos_of = |base: usize, last: usize, end: usize| -> usize {
+                        if RELEASED {
                             base.wrapping_sub(last).wrapping_add(end)
-                        };
-                        (
-                            f(base_l, hot.last_l, hot.end_l),
-                            f(base_r, hot.last_r, hot.end_r),
-                            f(base_l + 1, hot.last_l, hot.end_l),
-                            f(base_r + 1, hot.last_r, hot.end_r),
-                        )
-                    } else if MODE_TAG == HOT_MODE_NOLOOP {
-                        (base_l, base_r, base_l + 1, base_r + 1)
-                    } else {
-                        let w = |base: usize, end: usize| {
-                            if base > end {
-                                wrap_pos(base, hot.start, end)
-                            } else {
-                                base
-                            }
-                        };
-                        (
-                            w(base_l, hot.end_l),
-                            w(base_r, hot.end_r),
-                            w(base_l + 1, hot.end_l),
-                            w(base_r + 1, hot.end_r),
-                        )
+                        } else if MODE_TAG == HOT_MODE_NOLOOP {
+                            base
+                        } else if base > end {
+                            wrap_pos(base, hot.start, end)
+                        } else {
+                            base
+                        }
                     };
 
                     let (sl, sr) = if LINEAR {
+                        let pos_l = pos_of(base_l, hot.last_l, hot.end_l);
+                        let pos_r = pos_of(base_r, hot.last_r, hot.end_r);
+                        let pos_l1 = pos_of(base_l + 1, hot.last_l, hot.end_l);
+                        let pos_r1 = pos_of(base_r + 1, hot.last_r, hot.end_r);
                         let frac = (t - index as f64) as f32;
+                        let inv = 1.0 - frac;
                         let l0 = load_sample!(hot, pos_l, hot.ptr_l, hot.len_l);
                         let l1 = load_sample!(hot, pos_l1, hot.ptr_l, hot.len_l);
                         let r0 = load_sample!(hot, pos_r, hot.ptr_r, hot.len_r);
                         let r1 = load_sample!(hot, pos_r1, hot.ptr_r, hot.len_r);
-                        (l0 * (1.0 - frac) + l1 * frac, r0 * (1.0 - frac) + r1 * frac)
+                        (l0 * inv + l1 * frac, r0 * inv + r1 * frac)
                     } else {
+                        let pos_l = pos_of(base_l, hot.last_l, hot.end_l);
+                        let pos_r = pos_of(base_r, hot.last_r, hot.end_r);
                         (
                             load_sample!(hot, pos_l, hot.ptr_l, hot.len_l),
                             load_sample!(hot, pos_r, hot.ptr_r, hot.len_r),
@@ -1440,8 +1466,8 @@ fn render_uniform<S: Simd, const MODE_TAG: u8, const LINEAR: bool, const RELEASE
                     };
 
                     let env = lanes.get_unchecked_mut(k).env.next_frame_simd::<S>();
-                    *sl_arr.get_unchecked_mut(k) = env * (hot.gain_l * sl);
-                    *sr_arr.get_unchecked_mut(k) = env * (hot.gain_r * sr);
+                    *sl_arr.get_unchecked_mut(k) = env * (gains_l[k] * sl);
+                    *sr_arr.get_unchecked_mut(k) = env * (gains_r[k] * sr);
                 }
             }
             let sl = S::Vf32::load_from_slice(&sl_arr);

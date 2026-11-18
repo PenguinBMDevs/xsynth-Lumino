@@ -297,15 +297,30 @@ impl VoiceChannel {
         let frames = out.len() / 2;
         let width = crate::voice::batch_chunk_width();
         {
-            let mut all: Vec<&mut Box<dyn Voice>> = self
-                .key_voices
-                .iter_mut()
-                .flat_map(|key| key.data.iter_voices_mut())
-                .collect();
+            // Tracy: 收集阶段（每块一次 Vec<&mut ...> 分配，黑 MIDI 下 voice 数可达数百）。
+            // 粒度只在块级，不进入每帧 DSP 内核，避免 trace 爆炸与时序失真。
+            let mut all: Vec<&mut Box<dyn Voice>> =
+                crate::profiling::tracy_zone!("b_collect_voices", {
+                    self.key_voices
+                        .iter_mut()
+                        .flat_map(|key| key.data.iter_voices_mut())
+                        .collect()
+                });
+
+            // 工作量归一化：批渲染 lane 数 vs 标量回退 voice 数（A/B 定位用）。
+            #[cfg(feature = "tracy")]
+            let (mut scalar_count, mut batch_lanes) = (0u64, 0u64);
+
             let mut i = 0usize;
             while i < all.len() {
                 if all[i].batch_lane().is_none() {
-                    all[i].render_to(out);
+                    crate::profiling::tracy_zone!("b_scalar_voice", {
+                        all[i].render_to(out);
+                    });
+                    #[cfg(feature = "tracy")]
+                    {
+                        scalar_count += 1;
+                    }
                     i += 1;
                     continue;
                 }
@@ -317,10 +332,17 @@ impl VoiceChannel {
 
                 let mut j = start;
                 while j + width <= end {
-                    if !render_voice_chunk(&mut all[j..j + width], out, frames) {
+                    let ok = crate::profiling::tracy_zone!("b_batch_dsp", {
+                        render_voice_chunk(&mut all[j..j + width], out, frames)
+                    });
+                    if !ok {
                         for voice in all[j..j + width].iter_mut() {
                             voice.render_to(out);
                         }
+                    }
+                    #[cfg(feature = "tracy")]
+                    {
+                        batch_lanes += width as u64;
                     }
                     j += width;
                 }
@@ -328,13 +350,21 @@ impl VoiceChannel {
                     voice.render_to(out);
                 }
             }
-        }
 
-        for key in self.key_voices.iter_mut() {
-            if key.data.has_voices() {
-                key.data.remove_ended_voices();
+            #[cfg(feature = "tracy")]
+            {
+                crate::profiling::tracy_plot!("batch_lanes", batch_lanes as f64);
+                crate::profiling::tracy_plot!("scalar_voices", scalar_count as f64);
             }
         }
+
+        crate::profiling::tracy_zone!("b_remove_ended", {
+            for key in self.key_voices.iter_mut() {
+                if key.data.has_voices() {
+                    key.data.remove_ended_voices();
+                }
+            }
+        });
     }
 
     /// 按分级策略抢占 `count` 个活跃声部（供跨通道全局治理调用）。
@@ -602,7 +632,26 @@ fn render_voice_chunk(voices: &mut [&mut Box<dyn Voice>], out: &mut [f32], frame
     {
         return false;
     }
+    // 消融开关（仅诊断用）：XSYNTH_BATCH_MODE=0..4 走 render_batch_chunk_mode，
+    // 用于把批 DSP 内核拆到采样/包络/增益/biquad 阶段；未设置时走生产路径（零开销）。
+    #[cfg(feature = "tracy")]
+    if let Some(mode) = batch_mode_override() {
+        return crate::voice::render_batch_chunk_mode(&mut lanes, out, frames, mode);
+    }
     crate::voice::render_batch_chunk(&mut lanes, out, frames)
+}
+
+/// 诊断消融档位：`XSYNTH_BATCH_MODE` = 0..4 → Some(mode)，否则 None（生产路径）。
+/// 只在 tracy 构建下编译，用 OnceLock 缓存，避免热路径每次读环境变量。
+#[cfg(feature = "tracy")]
+fn batch_mode_override() -> Option<u32> {
+    static MODE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("XSYNTH_BATCH_MODE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v <= 4)
+    })
 }
 
 #[cfg(test)]
