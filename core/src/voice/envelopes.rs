@@ -407,6 +407,10 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
     }
 
     fn manually_build_simd_sample(&mut self) -> SIMDSampleMono<T> {
+        #[cfg(feature = "voice_probe")]
+        if self.probe {
+            crate::voice_probe::record_env_path(true);
+        }
         simd_invoke!(T, {
             let mut values = T::Vf32::set1(0.0);
             for i in 0..T::Vf32::WIDTH {
@@ -502,6 +506,8 @@ impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> 
 impl<T: Simd> SIMDVoiceEnvelope<T> {
     /// 实际包络推进（探针计时包裹在 `next_sample` 中；递归必须走本函数避免重复计时）。
     fn next_sample_inner(&mut self) -> SIMDSampleMono<T> {
+        #[cfg(feature = "voice_probe")]
+        let probe = self.probe;
         simd_invoke!(T, {
             match &mut self.state.stage_data {
                 StageData::Lerp(lerper, stage_time) => {
@@ -518,6 +524,10 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
                         }
                     } else {
                         // No special conditions happening, return the next entire simd array lerped
+                        #[cfg(feature = "voice_probe")]
+                        if probe {
+                            crate::voice_probe::record_env_path(false);
+                        }
                         let values = lerper.lerp_simd(stage_time.progress_simd_array());
                         stage_time.increment();
                         SIMDSampleMono(values)
@@ -532,6 +542,10 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
                             self.next_sample_inner()
                         }
                     } else {
+                        #[cfg(feature = "voice_probe")]
+                        if probe {
+                            crate::voice_probe::record_env_path(false);
+                        }
                         let values = lerper.lerp_simd(stage_time.progress_simd_array());
                         stage_time.increment();
                         SIMDSampleMono(values)
@@ -546,12 +560,22 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
                             self.next_sample_inner()
                         }
                     } else {
+                        #[cfg(feature = "voice_probe")]
+                        if probe {
+                            crate::voice_probe::record_env_path(false);
+                        }
                         let values = lerper.lerp_simd(stage_time.progress_simd_array());
                         stage_time.increment();
                         SIMDSampleMono(values)
                     }
                 }
-                StageData::Constant(constant) => SIMDSampleMono(*constant),
+                StageData::Constant(constant) => {
+                    #[cfg(feature = "voice_probe")]
+                    if probe {
+                        crate::voice_probe::record_env_path(false);
+                    }
+                    SIMDSampleMono(*constant)
+                }
             }
         })
     }

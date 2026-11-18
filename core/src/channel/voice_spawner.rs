@@ -5,6 +5,8 @@ use crate::voice::{Voice, VoiceControlData};
 pub struct VoiceSpawnerMatrix {
     voice_spawners_attack: Vec<Vec<Box<dyn VoiceSpawner>>>,
     voice_spawners_release: Vec<Vec<Box<dyn VoiceSpawner>>>,
+    /// 构造批 voice（仅单线程批渲染启用；并行 key 渲染下批 voice 只能标量回退）。
+    batch_voices: bool,
 }
 
 fn voice_iter_from_vec<'a>(
@@ -36,6 +38,24 @@ impl VoiceSpawnerMatrix {
         VoiceSpawnerMatrix {
             voice_spawners_attack,
             voice_spawners_release,
+            batch_voices: true,
+        }
+    }
+
+    /// 设置是否构造批 voice，并立即作用于已注册的 spawner（配置可在 soundfont 之后变更）。
+    pub fn set_batch_voices(&mut self, enabled: bool) {
+        if self.batch_voices == enabled {
+            return;
+        }
+        self.batch_voices = enabled;
+        for vec in self
+            .voice_spawners_attack
+            .iter_mut()
+            .chain(self.voice_spawners_release.iter_mut())
+        {
+            for spawner in vec.iter_mut() {
+                spawner.set_batch_voices(enabled);
+            }
         }
     }
 
@@ -80,13 +100,33 @@ impl VoiceSpawnerMatrix {
     }
 
     #[inline(always)]
-    pub fn set_spawners_attack(&mut self, key: u8, vel: u8, spawners: Vec<Box<dyn VoiceSpawner>>) {
+    pub fn set_spawners_attack(
+        &mut self,
+        key: u8,
+        vel: u8,
+        mut spawners: Vec<Box<dyn VoiceSpawner>>,
+    ) {
+        if !self.batch_voices {
+            for spawner in spawners.iter_mut() {
+                spawner.set_batch_voices(false);
+            }
+        }
         let index = self.get_spawners_index_at_attack(key, vel);
         self.voice_spawners_attack[index] = spawners;
     }
 
     #[inline(always)]
-    pub fn set_spawners_release(&mut self, key: u8, vel: u8, spawners: Vec<Box<dyn VoiceSpawner>>) {
+    pub fn set_spawners_release(
+        &mut self,
+        key: u8,
+        vel: u8,
+        mut spawners: Vec<Box<dyn VoiceSpawner>>,
+    ) {
+        if !self.batch_voices {
+            for spawner in spawners.iter_mut() {
+                spawner.set_batch_voices(false);
+            }
+        }
         let index = self.get_spawners_index_at_release(key, vel);
         self.voice_spawners_release[index] = spawners;
     }

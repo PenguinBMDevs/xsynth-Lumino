@@ -36,6 +36,8 @@ pub struct StereoSampledVoiceSpawner<S: 'static + Simd + Send + Sync> {
     exclusive_class: Option<u8>,
     vel: u8,
     stream_params: AudioStreamParams,
+    /// 构造 B1 批 voice（仅单线程批渲染路径启用；并行 key 渲染下应关闭）。
+    batch_voices: bool,
     _s: PhantomData<S>,
 }
 
@@ -68,6 +70,7 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
             exclusive_class: params.exclusive_class,
             vel,
             stream_params,
+            batch_voices: true,
             _s: PhantomData,
         }
     }
@@ -79,7 +82,8 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         if probe {
             crate::voice_probe::record_voice_kind(self.filter.is_some());
         }
-        self.begin_voice_impl(control, !probe && crate::voice::batching_supported(), probe)
+        let batch = self.batch_voices && !probe && crate::voice::batching_supported();
+        self.begin_voice_impl(control, batch, probe)
     }
 
     /// 构造 voice。`batch = true` 时优先构造 B1 批处理 voice（lane 即权威状态），
@@ -302,6 +306,10 @@ impl<S: 'static + Sync + Send + Simd> VoiceSpawner for StereoSampledVoiceSpawner
     fn exclusive_class(&self) -> Option<u8> {
         self.exclusive_class
     }
+
+    fn set_batch_voices(&mut self, enabled: bool) {
+        self.batch_voices = enabled;
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +409,7 @@ mod tests {
             exclusive_class: None,
             vel,
             stream_params,
+            batch_voices: true,
             _s: PhantomData,
         }
     }

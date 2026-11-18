@@ -25,8 +25,8 @@ use crate::voice::{
 #[cfg(feature = "voice_probe")]
 mod imp {
     use std::cell::Cell;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     use std::time::Instant;
 
     /// 线程本地累加器（热路径只写这里；每 2s 合并进全局）。
@@ -45,6 +45,8 @@ mod imp {
         samples: Cell<u64>,
         probed: Cell<u64>,
         filtered: Cell<u64>,
+        env_fast: Cell<u64>,
+        env_slow: Cell<u64>,
     }
 
     impl Local {
@@ -64,6 +66,8 @@ mod imp {
                 samples: Cell::new(0),
                 probed: Cell::new(0),
                 filtered: Cell::new(0),
+                env_fast: Cell::new(0),
+                env_slow: Cell::new(0),
             }
         }
     }
@@ -95,6 +99,8 @@ mod imp {
     static G_SAMPLES: AtomicU64 = AtomicU64::new(0);
     static G_PROBED_VOICES: AtomicU64 = AtomicU64::new(0);
     static G_FILTERED_VOICES: AtomicU64 = AtomicU64::new(0);
+    static G_ENV_FAST: AtomicU64 = AtomicU64::new(0);
+    static G_ENV_SLOW: AtomicU64 = AtomicU64::new(0);
 
     static LAST_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -226,6 +232,18 @@ mod imp {
         LOCAL.with(|l| add(&l.env_ns, ns));
     }
 
+    /// 记录包络本次走的是快路径（整组 SIMD）还是慢路径（逐帧标量 crossing）。
+    #[inline(always)]
+    pub fn record_env_path(slow: bool) {
+        LOCAL.with(|l| {
+            if slow {
+                add(&l.env_slow, 1)
+            } else {
+                add(&l.env_fast, 1)
+            }
+        });
+    }
+
     /// 记录一次逐声部 biquad 滤波耗时。
     #[inline(always)]
     pub fn record_cut_ticks(ticks: u64) {
@@ -301,6 +319,8 @@ mod imp {
             G_SAMPLES.fetch_add(l.samples.replace(0), Ordering::Relaxed);
             G_PROBED_VOICES.fetch_add(l.probed.replace(0), Ordering::Relaxed);
             G_FILTERED_VOICES.fetch_add(l.filtered.replace(0), Ordering::Relaxed);
+            G_ENV_FAST.fetch_add(l.env_fast.replace(0), Ordering::Relaxed);
+            G_ENV_SLOW.fetch_add(l.env_slow.replace(0), Ordering::Relaxed);
         });
 
         let now_ms = std::time::SystemTime::now()
@@ -327,6 +347,8 @@ mod imp {
         let cut_ns = G_CUT_NS.swap(0, Ordering::Relaxed);
         let probed = G_PROBED_VOICES.swap(0, Ordering::Relaxed);
         let filtered = G_FILTERED_VOICES.swap(0, Ordering::Relaxed);
+        let env_fast = G_ENV_FAST.swap(0, Ordering::Relaxed);
+        let env_slow = G_ENV_SLOW.swap(0, Ordering::Relaxed);
         let smpl_calls = G_SMPL_CALLS.swap(0, Ordering::Relaxed);
         let pitch_ns = G_PITCH_NS.swap(0, Ordering::Relaxed);
         let time_ns = G_TIME_NS.swap(0, Ordering::Relaxed);
@@ -348,8 +370,13 @@ mod imp {
         } else {
             voice_cpu_ns as f64 / voice_ns as f64
         };
+        let env_slow_pct = if env_fast + env_slow == 0 {
+            0.0
+        } else {
+            env_slow as f64 / (env_fast + env_slow) as f64 * 100.0
+        };
         eprintln!(
-            "[VP] voice/s={:.0} frames/voice={:.0} avg_voice wall={:.0}ns cpu={:.0}ns cpu/wall={:.2} | chain={:.0}ns mix={:.0}ns | smpl/s={:.0} ns/call: pitch={:.0} time={:.0} grab={:.0} total={:.0} env={:.0} cut={:.0} | ns/sample={:.2} | ksample/s={:.0} | filtered={:.0}%",
+            "[VP] voice/s={:.0} frames/voice={:.0} avg_voice wall={:.0}ns cpu={:.0}ns cpu/wall={:.2} | chain={:.0}ns mix={:.0}ns | smpl/s={:.0} ns/call: pitch={:.0} time={:.0} grab={:.0} total={:.0} env={:.0} cut={:.0} | ns/sample={:.2} | ksample/s={:.0} | filtered={:.0}% env_slow={:.1}%",
             voice_calls as f64 / secs,
             per(voice_frames, voice_calls),
             per(voice_ns, voice_calls),
@@ -371,6 +398,7 @@ mod imp {
             } else {
                 filtered as f64 / probed as f64 * 100.0
             },
+            env_slow_pct,
         );
     }
 }
@@ -402,6 +430,9 @@ mod imp {
 
     #[inline(always)]
     pub fn record_env_ticks(_ticks: u64) {}
+
+    #[inline(always)]
+    pub fn record_env_path(_slow: bool) {}
 
     #[inline(always)]
     pub fn record_cut_ticks(_ticks: u64) {}

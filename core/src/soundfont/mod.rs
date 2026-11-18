@@ -36,6 +36,12 @@ pub trait VoiceSpawner: Sync + Send {
     fn exclusive_class(&self) -> Option<u8> {
         None
     }
+    /// 控制是否构造 B1 批处理 voice。
+    ///
+    /// 批 voice 只在「无 key 级线程池的单线程批渲染」路径有收益；并行 key 渲染下
+    /// 跨 key 批内核不可用，批 voice 只能走标量回退（比链式 8 帧 SIMD 慢约 9%）。
+    /// 默认空实现：不支持批的 spawner 无需关心。
+    fn set_batch_voices(&mut self, _enabled: bool) {}
 }
 
 pub trait SoundfontBase: Sync + Send + std::fmt::Debug {

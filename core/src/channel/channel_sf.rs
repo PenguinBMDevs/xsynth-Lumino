@@ -38,6 +38,14 @@ impl ChannelSoundfont {
         }
     }
 
+    /// 配置是否构造批 voice：应仅在「无 key 级线程池、走单线程批渲染」时开启。
+    ///
+    /// 并行 key 渲染下跨 key 批内核不可用，批 voice 会退化为标量渲染，
+    /// 比链式 8 帧 SIMD voice 慢（实测并行 realtime_x 4.2 → 4.6）。
+    pub fn set_batch_voices(&mut self, enabled: bool) {
+        self.matrix.set_batch_voices(enabled);
+    }
+
     pub fn set_soundfonts(&mut self, soundfonts: Vec<Arc<dyn SoundfontBase>>) {
         if !are_arc_vecs_equal(&self.soundfonts, &soundfonts) {
             self.soundfonts = soundfonts;

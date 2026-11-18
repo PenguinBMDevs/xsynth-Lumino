@@ -141,7 +141,10 @@ impl VoiceChannel {
             vec
         }
 
-        let params = VoiceChannelParams::new(stream_params);
+        let mut params = VoiceChannelParams::new(stream_params);
+        // 批 voice 只在「无 key 级线程池」的单线程批渲染路径有收益；并行 key 渲染下
+        // 跨 key 批内核不可用，批 voice 只能标量回退（实测并行 realtime_x 4.2 → 4.6）。
+        params.channel_sf.set_batch_voices(threadpool.is_none());
         let shared_voice_counter = params.stats.voice_counter.clone();
 
         VoiceChannel {
@@ -235,23 +238,29 @@ impl VoiceChannel {
 
     fn push_key_events_and_render(&mut self, out: &mut [f32]) {
         crate::profiling::tracy_zone!("ch_apply_events", {
-            self.params.load_program();
+            crate::profiling::tracy_zone!("ch_load_program", {
+                self.params.load_program();
+            });
 
             // 1) 应用本块的全部事件（单线程，代价低），使声部统计反映本块最新状态。
-            for key in self.key_voices.iter_mut() {
-                for e in key.event_cache.drain(..) {
-                    key.data.send_event(
-                        e,
-                        &self.voice_control_data,
-                        &self.params.channel_sf,
-                        self.params.layers,
-                    );
+            crate::profiling::tracy_zone!("ch_spawn_voices", {
+                for key in self.key_voices.iter_mut() {
+                    for e in key.event_cache.drain(..) {
+                        key.data.send_event(
+                            e,
+                            &self.voice_control_data,
+                            &self.params.channel_sf,
+                            self.params.layers,
+                        );
+                    }
                 }
-            }
+            });
 
             // 2) 每通道声部上限治理：超限时优先杀"最老"的声部组（保留最新音符），
             //    使渲染负载有上界，同时不丢刚触发的音符。
-            self.enforce_max_voices();
+            crate::profiling::tracy_zone!("ch_gov", {
+                self.enforce_max_voices();
+            });
         });
 
         // A/B 归一化基准：本块渲染前的活跃声部数（= 本块工作量）。
