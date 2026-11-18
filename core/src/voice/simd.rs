@@ -286,6 +286,85 @@ impl<T: Simd> VoiceCombineSIMD<T> {
     }
 }
 
+/// 融合链：包络（mono）× 立体声常量增益 × 内层生成器（stereo）。
+///
+/// 旧链是两层 `VoiceCombineSIMD::mult`：
+/// `envelope × (gains × sampler)`——每 8 帧走三层嵌套 `next_sample`。
+/// 融合后单层调用；运算顺序保持旧链的 `env * (gain * sample)`，**逐位等价**，
+/// 仅消除嵌套调用与结构体间接。
+pub struct SIMDGainEnvelopeChain<S: Simd, E, G>
+where
+    E: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
+    G: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
+{
+    envelope: E,
+    inner: G,
+    gain_l: f32,
+    gain_r: f32,
+    _s: PhantomData<S>,
+}
+
+impl<S, E, G> SIMDGainEnvelopeChain<S, E, G>
+where
+    S: Simd,
+    E: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
+    G: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
+{
+    pub fn new(envelope: E, inner: G, gain_l: f32, gain_r: f32) -> Self {
+        SIMDGainEnvelopeChain {
+            envelope,
+            inner,
+            gain_l,
+            gain_r,
+            _s: PhantomData,
+        }
+    }
+}
+
+impl<S, E, G> VoiceGeneratorBase for SIMDGainEnvelopeChain<S, E, G>
+where
+    S: Simd,
+    E: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
+    G: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
+{
+    #[inline(always)]
+    fn ended(&self) -> bool {
+        self.envelope.ended() || self.inner.ended()
+    }
+
+    #[inline(always)]
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        self.envelope.signal_release(rel_type);
+        self.inner.signal_release(rel_type);
+    }
+
+    #[inline(always)]
+    fn process_controls(&mut self, control: &VoiceControlData) {
+        self.envelope.process_controls(control);
+        self.inner.process_controls(control);
+    }
+}
+
+impl<S, E, G> SIMDVoiceGenerator<S, SIMDSampleStereo<S>> for SIMDGainEnvelopeChain<S, E, G>
+where
+    S: Simd,
+    E: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
+    G: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
+{
+    #[inline(always)]
+    fn next_sample(&mut self) -> SIMDSampleStereo<S> {
+        simd_invoke!(S, {
+            let env = self.envelope.next_sample().0;
+            let sample = self.inner.next_sample();
+            let gain_l = S::Vf32::set1(self.gain_l);
+            let gain_r = S::Vf32::set1(self.gain_r);
+            // 运算顺序与旧链 `envelope × (gains × sampler)` 完全一致：
+            // 先 `gain * sample`，再 `env * (...)` —— 逐位等价，仅消除两层嵌套调用。
+            SIMDSampleStereo(env * (gain_l * sample.0), env * (gain_r * sample.1))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use VoiceControlData;

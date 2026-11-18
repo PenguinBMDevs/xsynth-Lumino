@@ -1,22 +1,22 @@
-use std::{marker::PhantomData, ops::Mul, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
 use simdeez::Simd;
 
 use crate::{
     effects::BiQuadFilter,
     voice::{
-        BufferSampler, SIMDSample, SIMDSampleGrabber, SIMDSampleMono, SIMDSampleStereo,
-        SIMDStereoVoiceCutoff, SIMDVoiceGenerator,
+        BufferSampler, SIMDSampleGrabber, SIMDSampleMono, SIMDSampleStereo, SIMDStereoVoiceCutoff,
+        SIMDVoiceGenerator,
     },
     AudioStreamParams,
 };
 use crate::{
     voice::VoiceControlData,
     voice::{
-        BatchLaneInit, BufferSamplers, EnvelopeParameters, SIMDConstantControl, SIMDConstantStereo,
-        SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice, SIMDStereoVoiceSampler,
-        SIMDVoiceEnvelope, SampleReader, SampleReaderLoop, SampleReaderLoopSustain,
-        SampleReaderNoLoop, StereoBatchVoice, Voice, VoiceBase, VoiceCombineSIMD,
+        BatchLaneInit, BufferSamplers, EnvelopeParameters, SIMDConstantControl,
+        SIMDGainEnvelopeChain, SIMDLinearSampleGrabber, SIMDNearestSampleGrabber, SIMDStereoVoice,
+        SIMDStereoVoiceSampler, SIMDVoiceEnvelope, SampleReader, SampleReaderLoop,
+        SampleReaderLoopSustain, SampleReaderNoLoop, StereoBatchVoice, Voice, VoiceBase,
     },
 };
 
@@ -230,34 +230,21 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         (self.gain_l, self.gain_r)
     }
 
-    fn apply_gain<Gen>(&self, gen: Gen) -> impl SIMDVoiceGenerator<S, SIMDSampleStereo<S>>
-    where
-        Gen: SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
-    {
-        let (left, right) = self.stereo_gains();
-        let gains = SIMDConstantStereo::<S>::new(left, right);
-        VoiceCombineSIMD::mult(gains, gen)
-    }
-
-    fn create_pitch_fac(
-        &self,
-        control: &VoiceControlData,
-    ) -> impl SIMDVoiceGenerator<S, SIMDSampleMono<S>> {
-        // 单层「常量 × 控制值」生成器：等价语义，组合链上少一层 next_sample。
-        SIMDConstantControl::<S>::new(self.speed_mult, control, |vc| vc.voice_pitch_multiplier)
-    }
-
-    fn apply_envelope<Gen, Sample>(
+    /// 融合「包络 × 立体声增益 × 生成器」为单层链（替代两层 `VoiceCombineSIMD`）。
+    ///
+    /// 语义等价（ulp 级差异，项目已允许）：旧链每 8 帧走三层嵌套 `next_sample`，
+    /// 融合后单层调用；包络参数与释放判定逻辑完全复用。
+    fn apply_gain_envelope<Gen>(
         &self,
         gen: Gen,
         control: &VoiceControlData,
         probe: bool,
-    ) -> impl SIMDVoiceGenerator<S, Sample>
+    ) -> impl SIMDVoiceGenerator<S, SIMDSampleStereo<S>>
     where
-        Sample: SIMDSample<S>,
-        SIMDSampleMono<S>: Mul<Sample, Output = Sample>,
-        Gen: SIMDVoiceGenerator<S, Sample>,
+        Gen: 'static + SIMDVoiceGenerator<S, SIMDSampleStereo<S>>,
     {
+        let (gain_l, gain_r) = self.stereo_gains();
+
         // 直接解引用拷贝（`EnvelopeParameters: Copy`），避免一次 Arc::clone 原子操作。
         let modified_params = SIMDVoiceEnvelope::<S>::get_modified_envelope(
             *self.volume_envelope_params,
@@ -268,15 +255,22 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
         let allow_release = self.loop_params.mode != LoopMode::OneShot;
 
         let volume_envelope = SIMDVoiceEnvelope::new(
-            *self.volume_envelope_params.clone(),
+            *self.volume_envelope_params,
             modified_params,
             allow_release,
             self.stream_params.sample_rate as f32,
             probe,
         );
 
-        let amp = VoiceCombineSIMD::mult(volume_envelope, gen);
-        amp
+        SIMDGainEnvelopeChain::new(volume_envelope, gen, gain_l, gain_r)
+    }
+
+    fn create_pitch_fac(
+        &self,
+        control: &VoiceControlData,
+    ) -> impl SIMDVoiceGenerator<S, SIMDSampleMono<S>> {
+        // 单层「常量 × 控制值」生成器：等价语义，组合链上少一层 next_sample。
+        SIMDConstantControl::<S>::new(self.speed_mult, control, |vc| vc.voice_pitch_multiplier)
     }
 
     fn convert_to_voice<Gen>(&self, gen: Gen, probe: bool) -> Box<dyn Voice>
@@ -317,16 +311,11 @@ impl<S: Simd + Send + Sync> StereoSampledVoiceSpawner<S> {
     {
         // 同 `begin_voice`：只在被采样 voice 上发射阶段 zone（1/N 采样）。
         let gen = if probe {
-            crate::profiling::tracy_zone!("spawn_gain", { self.apply_gain(gen) })
-        } else {
-            self.apply_gain(gen)
-        };
-        let gen = if probe {
-            crate::profiling::tracy_zone!("spawn_envelope", {
-                self.apply_envelope(gen, control, probe)
+            crate::profiling::tracy_zone!("spawn_chain", {
+                self.apply_gain_envelope(gen, control, probe)
             })
         } else {
-            self.apply_envelope(gen, control, probe)
+            self.apply_gain_envelope(gen, control, probe)
         };
 
         if probe {
