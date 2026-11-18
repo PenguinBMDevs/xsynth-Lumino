@@ -90,7 +90,9 @@ where
                 } else {
                     None
                 };
-                self.remainder = self.generator.next_sample();
+                // 用局部变量持有整组样本（64B）：整块路径每组都会消费完，
+                // 无需写回 `self.remainder`（尾部路径缺帧时会自行重新生成）。
+                let remainder = self.generator.next_sample();
                 #[cfg(feature = "voice_probe")]
                 if let Some(t0) = chain_t0 {
                     if let Some(t1) = crate::voice_probe::tick() {
@@ -98,8 +100,8 @@ where
                     }
                 }
 
-                let rem_l = self.remainder.0;
-                let rem_r = self.remainder.1;
+                let rem_l = remainder.0;
+                let rem_r = remainder.1;
                 for k in 0..width {
                     unsafe {
                         *buffer.get_unchecked_mut(i + 2 * k) += rem_l.get_unchecked(k);
