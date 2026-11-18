@@ -1,6 +1,7 @@
 //! 诊断工具：统计 MIDI 的音符密度随播放时间分布，用于给并行 bench 选固定区间。
 //!
-//! 用法：`cargo run --release -p xsynth-core --example midi_info -- <midi> [bucket_secs] [max_secs]`
+//! 用法：`cargo run --release -p xsynth-core --example midi_info -- <midi> [bucket_secs] [max_secs] [start_s] [end_s]`
+//! `start_s..end_s` 内的音符按 MIDI 通道统计（判断通道负载均衡）。
 
 use midi_toolkit::{
     events::{Event, MIDIEventEnum},
@@ -33,6 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_notes = 0u64;
     let mut total_events = 0u64;
 
+    // 可选：统计指定音频窗口内的每通道音符数（判断通道负载是否均衡）。
+    let start_s: f64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(70.0);
+    let end_s: f64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(90.0);
+    let mut per_channel = [0u64; 16];
+    let mut window_notes = 0u64;
+
     for batch in merged {
         time += batch.delta.max(0.0);
         if time >= max_secs {
@@ -48,6 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if n.velocity > 0 {
                     total_notes += 1;
                     buckets[idx].0 += 1;
+                    if time >= start_s && time < end_s {
+                        per_channel[(n.channel as usize).min(15)] += 1;
+                        window_notes += 1;
+                    }
                 }
             }
             buckets[idx].1 += 1;
@@ -56,6 +67,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("ppq={ppq} max_secs={max_secs} bucket={bucket}s");
     println!("total_notes={total_notes} total_events={total_events}");
+    println!("window {start_s:.1}s..{end_s:.1}s notes={window_notes}");
+    for (ch, notes) in per_channel.iter().enumerate() {
+        if *notes > 0 {
+            println!(
+                "  ch={ch:>2} notes={notes:>8} ({:.1}%)",
+                *notes as f64 * 100.0 / window_notes.max(1) as f64
+            );
+        }
+    }
     for (i, (notes, events)) in buckets.iter().enumerate() {
         if *notes == 0 && *events == 0 {
             continue;

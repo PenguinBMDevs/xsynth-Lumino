@@ -123,6 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut window_start: Option<Instant> = None;
     let (mut window_audio, mut window_blocks, mut window_events) = (0.0f64, 0u64, 0u64);
     let mut truncated = false;
+    // 可选输出校验（`XSYNTH_BENCH_CHECKSUM=1`）：窗口内 RMS/峰值，用于跨并行配置
+    // 对比「有没有丢/重声部」。混音求和顺序不同 → 不做逐位比较。
+    let checksum_enabled = std::env::var_os("XSYNTH_BENCH_CHECKSUM").is_some();
+    let (mut energy, mut peak) = (0.0f64, 0.0f32);
 
     println!(
         "Rendering (max {max_seconds}s wall, layers={layers:?}, parallel={parallel}, \
@@ -140,6 +144,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window_start = Some(Instant::now());
             }
             synth.read_samples(&mut buffer);
+            if checksum_enabled && window_start.is_some() {
+                for &s in &buffer {
+                    energy += (s as f64) * (s as f64);
+                    let a = s.abs();
+                    if a > peak {
+                        peak = a;
+                    }
+                }
+            }
             pending -= quantum_s;
             sim_time += quantum_s;
             audio_secs += quantum_s;
@@ -212,5 +225,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_audio / measured_elapsed,
         synth.voice_count()
     );
+    if checksum_enabled {
+        let samples = window_blocks as f64 * quantum_samples as f64;
+        println!(
+            "CHECKSUM rms={:.9} peak={:.9}",
+            (energy / samples.max(1.0)).sqrt(),
+            peak
+        );
+    }
     Ok(())
 }
